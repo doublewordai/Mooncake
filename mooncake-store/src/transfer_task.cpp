@@ -591,13 +591,19 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 // Since memcpy is bound by memory bandwidth, we only need one worker thread.
 constexpr int kDefaultMemcpyWorkers = 1;
 
+static int GetMemcpyWorkerCount() {
+    static const int value = GetPositiveEnvOrDefault("MC_STORE_MEMCPY_WORKERS",
+                                                     kDefaultMemcpyWorkers);
+    return value;
+}
+
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int num_workers = GetMemcpyWorkerCount();
+    VLOG(1) << "Creating MemcpyWorkerPool with " << num_workers << " workers";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }

@@ -893,7 +893,7 @@ ErrorCode Client::InitTransferEngine(
 
         Transport* transport = nullptr;
 
-        if (protocol == "rdma" || protocol == "efa") {
+        if (protocol == "rdma" || protocol == "efa" || protocol == "cxi") {
             if (!device_names.has_value() || device_names->empty()) {
                 LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";

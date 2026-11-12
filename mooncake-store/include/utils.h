@@ -357,6 +357,25 @@ void populate_hugetlb_mapping(void* ptr, size_t total_size);
 void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
                                    const std::vector<int>& numa_nodes);
 
+struct PrefaultResult {
+    size_t bytes = 0;           // bytes populated
+    bool used_madvise = false;  // every range took MADV_POPULATE_WRITE
+};
+
+/**
+ * @brief Fault in every page of a fresh anonymous mapping, in parallel.
+ *
+ * Each worker populates its range with madvise(MADV_POPULATE_WRITE) (Linux
+ * 5.14+), which allocates the pages, transparent huge pages included, without
+ * touching their contents; where that is refused it writes one byte per base
+ * page instead. Ranges are split on 2 MiB boundaries so no huge page is shared
+ * between workers. A lazily mapped segment otherwise takes these faults while
+ * serving, and on a host short of free contiguous memory each transparent huge
+ * page fault compacts synchronously, stalling the faulting thread for seconds.
+ * Call this only for a newly allocated mapping whose contents may be zeroed.
+ */
+PrefaultResult prefault_anonymous_mapping(void* ptr, size_t size);
+
 /**
  * Allocate mmap-backed buffer memory for host KV / transfer buffers.
  *

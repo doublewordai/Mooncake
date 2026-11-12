@@ -11,6 +11,7 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -971,6 +972,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         const bool parallel_hugetlb_population =
             protocol == "rdma" && should_use_hugepage;
 
+        // MC_STORE_PREFAULT_SEGMENT=1 faults every page of a lazily mapped
+        // segment in now, before it is mounted, instead of on first write
+        // while serving (see prefault_anonymous_mapping).
+        const bool prefault_segment = [] {
+            const char *raw = std::getenv("MC_STORE_PREFAULT_SEGMENT");
+            if (raw == nullptr || raw[0] == '\0') {
+                return false;
+            }
+            const auto parsed = TryParseBool(raw);
+            if (!parsed.has_value()) {
+                LOG(WARNING) << "Invalid MC_STORE_PREFAULT_SEGMENT='" << raw
+                             << "', not prefaulting";
+                return false;
+            }
+            return *parsed;
+        }();
+
         while (global_segment_size > 0) {
             size_t segment_size =
                 GetNextSegmentSize(global_segment_size, split_limit, alignment);
@@ -984,6 +1002,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            // Whether ptr is ordinary anonymous memory nothing has populated:
+            // the default allocator, or NUMA segments on base pages.
+            bool lazily_mapped = false;
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
@@ -995,6 +1016,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+                lazily_mapped = !should_use_hugepage;
             } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
@@ -1014,6 +1036,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
+#ifndef USE_VRAM_SEGMENT
+                lazily_mapped = this->protocol != "ascend" &&
+                                this->protocol != "ubshmem" &&
+                                this->protocol != "sunrise_link" &&
+                                this->protocol != "ub";
+#endif
             }
 
             if (!ptr) {
@@ -1064,6 +1092,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 } else if (!is_mmap_arena_allocation(ptr)) {
                     populate_hugetlb_mapping(ptr, mapped_size);
                 }
+            }
+
+            if (prefault_segment && lazily_mapped) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const PrefaultResult prefaulted =
+                    prefault_anonymous_mapping(ptr, mapped_size);
+                const double seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+                LOG(INFO) << "Prefaulted segment: " << prefaulted.bytes
+                          << " bytes in " << seconds << " s ("
+                          << (seconds > 0 ? prefaulted.bytes / BYTES_PER_GIB /
+                                                seconds
+                                          : 0)
+                          << " GiB/s, "
+                          << (prefaulted.used_madvise ? "MADV_POPULATE_WRITE"
+                                                      : "page writes")
+                          << ")";
             }
 
             auto pinned_region =

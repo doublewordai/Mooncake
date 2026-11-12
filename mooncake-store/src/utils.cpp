@@ -306,6 +306,61 @@ void populate_hugetlb_numa_mapping(void *ptr, size_t total_size,
     touch_numa_mmap_pages(ptr, total_size, hugepage_size, numa_nodes);
 }
 
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23  // Linux 5.14; older headers lack it
+#endif
+
+namespace {
+
+// Populates [begin, begin + len). Returns whether madvise did it.
+bool prefault_range(char *begin, size_t len) {
+    if (madvise(begin, len, MADV_POPULATE_WRITE) == 0) {
+        return true;
+    }
+    const size_t page_size = static_cast<size_t>(getpagesize());
+    volatile char *data = begin;
+    for (size_t offset = 0; offset < len; offset += page_size) {
+        data[offset] = 0;
+    }
+    return false;
+}
+
+}  // namespace
+
+PrefaultResult prefault_anonymous_mapping(void *ptr, size_t size) {
+    PrefaultResult result;
+    if (ptr == nullptr || size == 0) {
+        return result;
+    }
+    constexpr size_t kChunk = 2 * 1024 * 1024;  // one x86-64 THP
+    const size_t chunks = (size + kChunk - 1) / kChunk;
+    const size_t num_threads = touch_thread_count(chunks);
+    const size_t chunks_per_thread = (chunks + num_threads - 1) / num_threads;
+
+    auto *base = static_cast<char *>(ptr);
+    std::atomic<bool> all_madvise{true};
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            const size_t begin = i * chunks_per_thread * kChunk;
+            if (begin >= size) {
+                break;
+            }
+            const size_t len =
+                std::min(chunks_per_thread * kChunk, size - begin);
+            threads.emplace_back([&all_madvise, base, begin, len] {
+                if (!prefault_range(base + begin, len)) {
+                    all_madvise.store(false, std::memory_order_relaxed);
+                }
+            });
+        }
+    }  // jthreads join here
+    result.bytes = size;
+    result.used_madvise = all_madvise.load();
+    return result;
+}
+
 void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     return allocate_buffer_mmap_memory(total_size, alignment, false);
 }

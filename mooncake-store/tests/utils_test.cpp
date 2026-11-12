@@ -10,6 +10,10 @@
 #include <thread>
 #include <unistd.h>
 #include <errno.h>
+#include <cstring>
+#include <sys/mman.h>
+#include <algorithm>
+#include <vector>
 
 using namespace mooncake;
 
@@ -267,4 +271,38 @@ TEST(UtilsTest, AutoPortBinderCustomRange) {
 
     EXPECT_GE(port, 50000);
     EXPECT_LE(port, 50100);
+}
+
+namespace {
+
+size_t resident_pages(void* ptr, size_t size) {
+    const size_t page_size = static_cast<size_t>(getpagesize());
+    std::vector<unsigned char> resident((size + page_size - 1) / page_size);
+    EXPECT_EQ(mincore(ptr, size, resident.data()), 0) << std::strerror(errno);
+    return std::count_if(resident.begin(), resident.end(),
+                         [](unsigned char page) { return (page & 1) != 0; });
+}
+
+}  // namespace
+
+TEST(PrefaultTest, PopulatesEveryPageOfAFreshMapping) {
+    // Not a multiple of 2 MiB, so the last worker's range is partial.
+    const size_t size = (64ull << 20) + 3 * static_cast<size_t>(getpagesize());
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT_NE(ptr, MAP_FAILED);
+    EXPECT_EQ(resident_pages(ptr, size), 0u);
+
+    const PrefaultResult result = prefault_anonymous_mapping(ptr, size);
+
+    EXPECT_EQ(result.bytes, size);
+    const size_t page_size = static_cast<size_t>(getpagesize());
+    EXPECT_EQ(resident_pages(ptr, size), (size + page_size - 1) / page_size);
+    munmap(ptr, size);
+}
+
+TEST(PrefaultTest, NullOrEmptyMappingIsANoOp) {
+    EXPECT_EQ(prefault_anonymous_mapping(nullptr, 1 << 20).bytes, 0u);
+    int stack_value = 0;
+    EXPECT_EQ(prefault_anonymous_mapping(&stack_value, 0).bytes, 0u);
 }

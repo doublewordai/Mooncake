@@ -1,0 +1,16 @@
+# Test-only: build the CUDA 13 / Python 3.12 wheel of this branch (MC_STORE_PREFAULT_SEGMENT) so its
+# mooncake_client can be tried in an islands soak. Publishes nothing; the wheel is a run artifact.
+name: Build prefault client (test only)
+on:
+  push:
+    branches: [prefault-store-segment-build]
+permissions:
+  contents: read
+jobs:
+  wheel:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-prefault
+      version-override: 0.3.13.post1+prefault

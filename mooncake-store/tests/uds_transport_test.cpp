@@ -8,7 +8,11 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace mooncake {
@@ -45,6 +49,33 @@ bool waitForFlag(const std::atomic<bool> &flag) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return flag.load();
+}
+
+// Creates a private directory for filesystem socket tests and removes it,
+// along with any socket the test left behind, on destruction.
+class TempSocketDir {
+   public:
+    TempSocketDir() {
+        char path[] = "/tmp/uds_fs_test_XXXXXX";
+        if (mkdtemp(path) != nullptr) dir_ = path;
+    }
+    ~TempSocketDir() {
+        if (dir_.empty()) return;
+        unlink(path("sock").c_str());
+        rmdir(dir_.c_str());
+    }
+    bool valid() const { return !dir_.empty(); }
+    std::string path(const std::string &name) const {
+        return dir_ + "/" + name;
+    }
+
+   private:
+    std::string dir_;
+};
+
+bool isSocketFile(const std::string &path) {
+    struct stat st;
+    return lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode);
 }
 
 }  // namespace
@@ -257,6 +288,225 @@ TEST(UdsTransportTest, StartRequiresRegisteredHandler) {
     auto start_result = acceptor.start();
     ASSERT_FALSE(start_result);
     EXPECT_NE(start_result.error().find("handler"), std::string::npos);
+}
+
+TEST(UdsTransportTest, IsFilesystemUdsPath) {
+    EXPECT_TRUE(isFilesystemUdsPath("/run/mooncake/client.sock"));
+    EXPECT_FALSE(isFilesystemUdsPath("@mooncake_client_50052.sock"));
+    EXPECT_FALSE(isFilesystemUdsPath("relative.sock"));
+    EXPECT_FALSE(isFilesystemUdsPath(""));
+}
+
+TEST(UdsTransportTest, FilesystemSocketAcceptAndConnect) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([](UdsConnection &connection) {
+        uint32_t value = 0;
+        EXPECT_EQ(connection.recvRaw(&value, sizeof(value)), 0);
+        value += 1;
+        EXPECT_EQ(connection.sendRaw(&value, sizeof(value)), 0);
+    });
+    auto start_result = acceptor.start();
+    ASSERT_TRUE(start_result) << start_result.error();
+    EXPECT_TRUE(isSocketFile(socket_path));
+
+    UdsConnector connector(socket_path);
+    auto connection_result = connector.connect();
+    ASSERT_TRUE(connection_result) << connection_result.error();
+    auto connection = std::move(connection_result.value());
+
+    uint32_t value = 41;
+    ASSERT_EQ(connection->sendRaw(&value, sizeof(value)), 0);
+    ASSERT_EQ(connection->recvRaw(&value, sizeof(value)), 0);
+    EXPECT_EQ(value, 42u);
+
+    acceptor.stop();
+    // The acceptor removes the socket file it created.
+    EXPECT_FALSE(isSocketFile(socket_path));
+    EXPECT_FALSE(UdsConnector(socket_path).connect());
+}
+
+TEST(UdsTransportTest, FilesystemSocketPassesMemfd) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+    constexpr size_t kSize = 4096;
+    const char kMessage[] = "written-by-client";
+    const char kReply[] = "written-by-server";
+    std::atomic<bool> verified{false};
+
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([&](UdsConnection &connection) {
+        uint32_t marker = 0;
+        int fd = connection.recvFd(&marker, sizeof(marker));
+        ASSERT_GE(fd, 0);
+        EXPECT_EQ(marker, 11u);
+        void *mapping = mmap(nullptr, kSize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                             fd, /*offset=*/0);
+        close(fd);
+        ASSERT_NE(mapping, MAP_FAILED);
+        EXPECT_EQ(std::string(static_cast<const char *>(mapping)), kMessage);
+        memcpy(mapping, kReply, sizeof(kReply));
+        munmap(mapping, kSize);
+        verified = true;
+        uint8_t ack = 1;
+        EXPECT_EQ(connection.sendRaw(&ack, sizeof(ack)), 0);
+    });
+    auto start_result = acceptor.start();
+    ASSERT_TRUE(start_result) << start_result.error();
+
+    int memfd = memfd_create("uds_transport_test", MFD_CLOEXEC);
+    ASSERT_GE(memfd, 0);
+    ASSERT_EQ(ftruncate(memfd, kSize), 0);
+    void *mapping =
+        mmap(nullptr, kSize, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+
+    memcpy(mapping, kMessage, sizeof(kMessage));
+
+    UdsConnector connector(socket_path);
+    auto connection_result = connector.connect();
+    ASSERT_TRUE(connection_result) << connection_result.error();
+    auto connection = std::move(connection_result.value());
+
+    uint32_t marker = 11;
+    ASSERT_EQ(connection->sendFd(memfd, &marker, sizeof(marker)), 0);
+    close(memfd);
+
+    // The server read our write through its own mapping and replied through
+    // it; the reply must be visible through ours.
+    uint8_t ack = 0;
+    ASSERT_EQ(connection->recvRaw(&ack, sizeof(ack)), 0);
+    EXPECT_EQ(ack, 1);
+    EXPECT_TRUE(verified.load());
+    EXPECT_EQ(std::string(static_cast<const char *>(mapping)), kReply);
+    munmap(mapping, kSize);
+    acceptor.stop();
+}
+
+TEST(UdsTransportTest, FilesystemSocketReplacesStaleSocketFile) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+
+    // Leave a bound socket file behind with no listener, as a crashed
+    // process would.
+    int stale_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_GE(stale_fd, 0);
+    sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+    ASSERT_EQ(bind(stale_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)),
+              0);
+    close(stale_fd);
+    ASSERT_TRUE(isSocketFile(socket_path));
+
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([](UdsConnection &) {});
+    auto start_result = acceptor.start();
+    ASSERT_TRUE(start_result) << start_result.error();
+
+    UdsConnector connector(socket_path);
+    auto connection_result = connector.connect();
+    EXPECT_TRUE(connection_result) << connection_result.error();
+    acceptor.stop();
+}
+
+TEST(UdsTransportTest, FilesystemSocketRefusesLiveListener) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+
+    UdsAcceptor first(socket_path);
+    first.registerHandler([](UdsConnection &) {});
+    auto first_result = first.start();
+    ASSERT_TRUE(first_result) << first_result.error();
+
+    UdsAcceptor second(socket_path);
+    second.registerHandler([](UdsConnection &) {});
+    auto second_result = second.start();
+    ASSERT_FALSE(second_result);
+    EXPECT_NE(second_result.error().find("in use"), std::string::npos);
+
+    // The first listener still owns the path.
+    EXPECT_TRUE(UdsConnector(socket_path).connect());
+    first.stop();
+}
+
+TEST(UdsTransportTest, FilesystemSocketRefusesToUnlinkRegularFile) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+
+    int fd = open(socket_path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(write(fd, "keep", 4), 4);
+    close(fd);
+
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([](UdsConnection &) {});
+    auto start_result = acceptor.start();
+    ASSERT_FALSE(start_result);
+    EXPECT_NE(start_result.error().find("non-socket"), std::string::npos);
+
+    struct stat st;
+    ASSERT_EQ(lstat(socket_path.c_str(), &st), 0);
+    EXPECT_TRUE(S_ISREG(st.st_mode));
+    EXPECT_EQ(st.st_size, 4);
+}
+
+TEST(UdsTransportTest, FilesystemSocketRefusesToUnlinkDirectory) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+    const std::string socket_path = dir.path("sock");
+    ASSERT_EQ(mkdir(socket_path.c_str(), 0700), 0);
+
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([](UdsConnection &) {});
+    EXPECT_FALSE(acceptor.start());
+
+    struct stat st;
+    ASSERT_EQ(lstat(socket_path.c_str(), &st), 0);
+    EXPECT_TRUE(S_ISDIR(st.st_mode));
+    rmdir(socket_path.c_str());
+}
+
+TEST(UdsTransportTest, FilesystemSocketAppliesMode) {
+    TempSocketDir dir;
+    ASSERT_TRUE(dir.valid());
+
+    for (mode_t mode : {static_cast<mode_t>(0660), static_cast<mode_t>(0600),
+                        static_cast<mode_t>(0666)}) {
+        const std::string socket_path = dir.path("sock");
+        UdsAcceptor acceptor(socket_path, mode);
+        acceptor.registerHandler([](UdsConnection &) {});
+        auto start_result = acceptor.start();
+        ASSERT_TRUE(start_result) << start_result.error();
+
+        struct stat st;
+        ASSERT_EQ(lstat(socket_path.c_str(), &st), 0);
+        EXPECT_TRUE(S_ISSOCK(st.st_mode));
+        EXPECT_EQ(st.st_mode & 07777, mode);
+        acceptor.stop();
+    }
+}
+
+TEST(UdsTransportTest, FilesystemSocketRejectsTooLongPath) {
+    std::string socket_path =
+        "/" + std::string(sizeof(sockaddr_un{}.sun_path), 'x');
+    UdsAcceptor acceptor(socket_path);
+    acceptor.registerHandler([](UdsConnection &) {});
+    auto start_result = acceptor.start();
+    ASSERT_FALSE(start_result);
+    EXPECT_NE(start_result.error().find("too long"), std::string::npos);
+
+    auto connection_result = UdsConnector(socket_path).connect();
+    ASSERT_FALSE(connection_result);
+    EXPECT_NE(connection_result.error().find("too long"), std::string::npos);
 }
 
 }  // namespace mooncake

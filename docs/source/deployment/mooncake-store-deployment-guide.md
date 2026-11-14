@@ -1359,6 +1359,43 @@ mooncake_client \
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, `/metrics/summary`, and `/version` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
+| `--ipc_socket_path` | empty | Unix socket for dummy-client shared-memory registration; see below |
+| `--ipc_socket_mode` | `0660` | Octal permission mode of a filesystem `--ipc_socket_path` |
+
+#### IPC socket for dummy clients
+
+A dummy client passes its shared-memory fd to the real client over a Unix
+domain socket. By default this is the abstract socket
+`@mooncake_client_<port>.sock`. Abstract sockets belong to a network
+namespace, so the dummy client must share the real client's network namespace
+(the same host, or the same Kubernetes pod).
+
+To connect across network namespaces on one machine, such as separate pods on
+the same Kubernetes node, use a filesystem socket instead: set
+`--ipc_socket_path` on `mooncake_client` and the same path on each dummy
+client. Any path starting with `/` is a filesystem socket. Both sides also read
+`MOONCAKE_IPC_SOCKET_PATH`, which applies when the flag (or the `setup_dummy`
+`ipc_socket_path` argument) is empty, so existing `setup_dummy` callers switch
+with only the environment variable.
+
+```bash
+# Real client pod (mounts hostPath /run/mooncake)
+mooncake_client --ipc_socket_path=/run/mooncake/client.sock --ipc_socket_mode=0660 ...
+
+# Dummy client pods (mount the same hostPath)
+export MOONCAKE_IPC_SOCKET_PATH=/run/mooncake/client.sock
+```
+
+On startup the real client removes a stale socket file left at the path by a
+previous run. It refuses to start if the path is a regular file or directory,
+or if another process is still listening on it. It removes the socket file when
+it stops. Both sides log whether they use an abstract name or a filesystem
+path.
+
+**Security:** any process that can connect to the socket can register memory
+with the real client. The socket is created with `--ipc_socket_mode` (default
+`0660`: owner and group only). Mount the socket directory only into pods you
+trust, and run those pods with a user or group that the mode allows.
 
 `mooncake_client --version` prints the release version plus the short git hash,
 and the same value is logged at startup.

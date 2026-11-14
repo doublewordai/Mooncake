@@ -116,6 +116,10 @@ class RealClient : public PyClient {
         return -1;
     };
 
+    // Permission bits applied to a filesystem IPC socket (one whose path
+    // starts with '/'). Must be called before setup. Default 0660.
+    void set_ipc_socket_mode(unsigned int mode) { ipc_socket_mode_ = mode; }
+
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
@@ -1332,6 +1336,7 @@ class RealClient : public PyClient {
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
+    unsigned int ipc_socket_mode_ = 0660;
     std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();

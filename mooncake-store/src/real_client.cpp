@@ -9047,7 +9047,8 @@ void RealClient::stop_dummy_client_monitor() {
     }
 }
 int RealClient::start_ipc_server() {
-    uds_acceptor_ = std::make_unique<UdsAcceptor>(ipc_socket_path_);
+    uds_acceptor_ =
+        std::make_unique<UdsAcceptor>(ipc_socket_path_, ipc_socket_mode_);
     uds_acceptor_->registerHandler([this](UdsConnection &connection) {
         auto timeout_result = connection.setRecvTimeout(kIpcRequestRecvTimeout);
         if (!timeout_result) {

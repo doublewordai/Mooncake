@@ -16,6 +16,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "uds_transport.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -2553,7 +2554,8 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+               size_t local_buffer_size, const std::string &server_address,
+               const std::string &ipc_socket_path) {
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
@@ -2561,12 +2563,36 @@ PYBIND11_MODULE(_store, m) {
                 resource_tracker.registerInstance(
                     std::static_pointer_cast<PyClient>(self.store_));
                 auto [ip, port] = parseHostNameWithPort(server_address);
-                return self.store_->setup_dummy(
-                    mem_pool_size, local_buffer_size, server_address,
-                    "@mooncake_client_" + std::to_string(port) + ".sock");
+                // Precedence: argument, MOONCAKE_IPC_SOCKET_PATH, then the
+                // abstract name derived from the real client's port.
+                std::string socket_path = ipc_socket_path;
+                if (socket_path.empty()) {
+                    const char *env_path =
+                        std::getenv("MOONCAKE_IPC_SOCKET_PATH");
+                    if (env_path != nullptr) socket_path = env_path;
+                }
+                if (socket_path.empty()) {
+                    socket_path =
+                        "@mooncake_client_" + std::to_string(port) + ".sock";
+                }
+                if (isFilesystemUdsPath(socket_path)) {
+                    LOG(INFO) << "Dummy client IPC socket: filesystem path "
+                              << socket_path;
+                } else {
+                    LOG(INFO) << "Dummy client IPC socket: abstract name "
+                              << socket_path;
+                }
+                return self.store_->setup_dummy(mem_pool_size,
+                                                local_buffer_size,
+                                                server_address, socket_path);
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
-            py::arg("server_address"))
+            py::arg("server_address"), py::arg("ipc_socket_path") = "",
+            "Set up a dummy client that forwards to a real client at "
+            "server_address. ipc_socket_path selects the Unix socket used to "
+            "share memory with the real client: a path starting with '/' is "
+            "a filesystem socket; empty uses env MOONCAKE_IPC_SOCKET_PATH, "
+            "then the abstract socket @mooncake_client_<port>.sock.")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,

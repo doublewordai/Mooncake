@@ -1,0 +1,16 @@
+# Test-only: build the CUDA 13 / Python 3.12 wheel of the filesystem-socket patch (doublewordai/Mooncake#3) so its
+# real client and dummy client can be tried in research jobs. Publishes nothing; the wheel is a run artifact.
+name: Build uds-socket wheel (test only)
+on:
+  push:
+    branches: [dw/uds-filesystem-socket-build]
+permissions:
+  contents: read
+jobs:
+  wheel:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-uds-socket
+      version-override: 0.3.14+udssocket

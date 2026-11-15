@@ -927,6 +927,12 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    // Random value fixed for the life of this process. A DummyClient compares
+    // it across pings to notice a restarted RealClient at the same address,
+    // even when the restart is faster than one ping interval.
+    tl::expected<uint64_t, ErrorCode> get_instance_id_internal();
+    uint64_t instance_id() const { return instance_id_; }
+
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
@@ -1228,6 +1234,7 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+    const uint64_t instance_id_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {

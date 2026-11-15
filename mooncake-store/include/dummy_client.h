@@ -3,6 +3,7 @@
 #include "common/result.h"
 
 #include <atomic>
+#include <optional>
 #include <csignal>
 #include <mutex>
 #include <shared_mutex>
@@ -362,6 +363,17 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+
+    // Fast-restart detection: the RealClient's per-process instance id as
+    // last seen (0 = unknown), whether that RealClient reports one at all,
+    // and a request (set when an RPC is answered CLIENT_NOT_FOUND) to
+    // re-register shared memory without waiting for a failed ping.
+    std::atomic<uint64_t> real_instance_id_{0};
+    std::atomic<bool> instance_id_supported_{false};
+    std::atomic<bool> reregister_requested_{false};
+    std::optional<uint64_t> fetch_real_instance_id();
+    void request_reregister(ErrorCode error);
+    bool reregister_and_restore();
 
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex external_fabric_registration_mutex_;

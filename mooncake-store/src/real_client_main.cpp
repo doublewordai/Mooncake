@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -105,6 +106,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::get_instance_id_internal>(
+        &real_client);
     server.register_handler<&RealClient::acquire_hot_cache>(&real_client);
     server.register_handler<&RealClient::release_hot_cache>(&real_client);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&real_client);
@@ -180,6 +183,12 @@ int main(int argc, char *argv[]) {
     }
 
     auto client_inst = RealClient::create();
+    {
+        char id_str[17];
+        snprintf(id_str, sizeof(id_str), "%016llx",
+                 static_cast<unsigned long long>(client_inst->instance_id()));
+        LOG(INFO) << "Real client instance id: " << id_str;
+    }
     client_inst->set_ipc_socket_mode(
         static_cast<unsigned int>(ipc_socket_mode));
     auto res = client_inst->setup_internal(

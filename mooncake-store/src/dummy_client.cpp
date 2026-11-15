@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 #include "real_client.h"
 #include "dummy_client.h"
@@ -167,6 +168,9 @@ constexpr bool can_invoke_when_disconnected() {
     using Method = std::remove_reference_t<decltype(ServiceMethod)>;
     return std::is_same_v<
                Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
+           std::is_same_v<
+               Method, std::remove_reference_t<
+                           decltype(&RealClient::get_instance_id_internal)>> ||
            std::is_same_v<Method,
                           std::remove_reference_t<
                               decltype(&RealClient::service_ready_internal)>> ||
@@ -213,7 +217,9 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
-            co_return result->result();
+            tl::expected<ReturnType, ErrorCode> value = result->result();
+            if (!value.has_value()) request_reregister(value.error());
+            co_return value;
         }());
 }
 
@@ -262,7 +268,12 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
                 }
                 co_return error_results;
             }
-            co_return result->result();
+            std::vector<tl::expected<ResultType, ErrorCode>> values =
+                result->result();
+            for (const auto& value : values) {
+                if (!value.has_value()) request_reregister(value.error());
+            }
+            co_return values;
         }());
 }
 
@@ -507,6 +518,17 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to real client";
         return -1;
+    }
+    if (auto id = fetch_real_instance_id()) {
+        real_instance_id_.store(*id);
+        instance_id_supported_.store(true);
+        LOG(INFO) << "RealClient instance id: " << std::hex << *id << std::dec;
+    } else {
+        // An older RealClient has no get_instance_id_internal handler.
+        instance_id_supported_.store(false);
+        LOG(WARNING) << "RealClient does not report an instance id (older "
+                        "build); a restart within one ping interval will "
+                        "not be detected";
     }
 
 #ifdef USE_ASCEND_DIRECT
@@ -2091,24 +2113,150 @@ tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
     return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
 }
 
+std::optional<uint64_t> DummyClient::fetch_real_instance_id() {
+    auto id = invoke_rpc<&RealClient::get_instance_id_internal, uint64_t>();
+    if (!id.has_value()) return std::nullopt;
+    return id.value();
+}
+
+void DummyClient::request_reregister(ErrorCode error) {
+    // Only an "unknown client" answer from the RealClient asks for this.
+    if (error != ErrorCode::CLIENT_NOT_FOUND) return;
+    if (!reregister_requested_.exchange(true)) {
+        LOG(WARNING) << "RealClient does not know client_id=" << client_id_
+                     << "; re-registering shared memory";
+    }
+}
+
+bool DummyClient::reregister_and_restore() {
+    // Re-register ALL shms. Re-registering a mapping the RealClient still
+    // holds is a no-op on its side ("Segment already mapped").
+    // Re-register ALL shms
+    bool all_registered = true;
+    const auto& shms = shm_helper_->get_shms();
+    for (const auto& shm_ptr : shms) {
+        if (shm_ptr->registered) {
+            if (globalConfig().ascend_agent_mode) {
+                if (register_ascend_shm(shm_ptr.get(), shm_ptr->is_local) !=
+                    0) {
+                    LOG(WARNING) << "Failed to re-register Ascend shared "
+                                    "memory during reconnection";
+                    all_registered = false;
+                    break;
+                }
+            } else if (register_shm_via_ipc(shm_ptr.get(), shm_ptr->is_local) !=
+                       0) {
+                LOG(WARNING) << "Failed to re-register shared memory "
+                                "during reconnection";
+                all_registered = false;
+                break;
+            }
+        }
+    }
+
+#if defined(USE_ASCEND_DIRECT)
+    if (all_registered && globalConfig().ascend_agent_mode) {
+        if (globalConfig().ascend_use_fabric_mem &&
+            reregister_fabric_buffers() != 0) {
+            LOG(WARNING) << "Failed to re-register Fabric buffers "
+                            "during reconnection";
+            all_registered = false;
+        }
+        if (all_registered && reregister_device_buffers() != 0) {
+            LOG(WARNING) << "Failed to re-register device buffers "
+                            "during reconnection";
+            all_registered = false;
+        }
+    }
+#endif
+
+    if (!all_registered) return false;
+    LOG(INFO) << "Re-registered all shared memorys successfully";
+
+    // Even if register_shm_via_ipc succeeded, check that RPC is responsive
+    auto check_rpc = invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+    if (!check_rpc.has_value() ||
+        check_rpc.value().client_status != ClientStatus::OK) {
+        return false;
+    }
+    if (instance_id_supported_.load()) {
+        auto id = fetch_real_instance_id();
+        if (!id) return false;
+        real_instance_id_.store(*id);
+    }
+    reregister_requested_.store(false);
+    LOG(INFO) << "RPC connection restored";
+    connected_.store(true);
+    return true;
+}
+
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
     const int fail_ping_interval_ms = 1000;
     const int retry_connect_interval_ms = 2000;
+    const int wake_check_ms = 50;
 
     int ping_fail_count = 0;
+
+    auto reconnect = [&]() {
+        while (ping_running_) {
+            if (reregister_and_restore()) {
+                ping_fail_count = 0;
+                return;
+            }
+            LOG(WARNING) << "Reconnection attempt failed, retrying in "
+                         << retry_connect_interval_ms << "ms";
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(retry_connect_interval_ms));
+        }
+    };
 
     while (ping_running_) {
         auto ping_result =
             invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+        bool healthy = ping_result.has_value() &&
+                       ping_result.value().client_status == ClientStatus::OK;
 
-        if (ping_result.has_value() &&
-            ping_result.value().client_status == ClientStatus::OK) {
+        // A RealClient that restarted within one ping interval answers the
+        // ping like the old one did, but has none of our shared memory
+        // mapped. Its instance id gives it away.
+        bool instance_changed = false;
+        if (healthy && instance_id_supported_.load()) {
+            auto id = fetch_real_instance_id();
+            if (!id) {
+                healthy = false;
+            } else if (*id != real_instance_id_.load()) {
+                instance_changed = true;
+                LOG(ERROR) << "RealClient instance changed (" << std::hex
+                           << real_instance_id_.load() << " -> " << *id
+                           << std::dec << "), re-registering shared memory";
+            }
+        }
+        bool unknown_client = healthy && reregister_requested_.load();
+        if (unknown_client && !instance_changed) {
+            LOG(ERROR) << "RealClient reported client_id=" << client_id_
+                       << " as unknown, re-registering shared memory";
+        }
+
+        if (instance_changed || unknown_client) {
+            connected_.store(false);
+            last_ping_healthy_.store(false);
+            reconnect();
+            continue;
+        }
+
+        if (healthy) {
             ping_fail_count = 0;
             last_ping_healthy_.store(true);
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(success_ping_interval_ms));
+            // Sleep in short steps so a CLIENT_NOT_FOUND seen by an RPC
+            // triggers re-registration without waiting for the next ping.
+            for (int waited = 0; waited < success_ping_interval_ms &&
+                                 ping_running_ && !reregister_requested_.load();
+                 waited += wake_check_ms) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(wake_check_ms));
+            }
             continue;
         }
 
@@ -2121,73 +2269,7 @@ void DummyClient::ping_thread_main() {
         if (ping_fail_count >= max_ping_fail_count) {
             connected_.store(false);
             LOG(ERROR) << "RealClient lost, entering reconnection loop...";
-
-            // Reconnection Loop
-            while (ping_running_) {
-                // Re-register ALL shms
-                bool all_registered = true;
-                const auto& shms = shm_helper_->get_shms();
-                for (const auto& shm_ptr : shms) {
-                    if (shm_ptr->registered) {
-                        if (globalConfig().ascend_agent_mode) {
-                            if (register_ascend_shm(shm_ptr.get(),
-                                                    shm_ptr->is_local) != 0) {
-                                LOG(WARNING)
-                                    << "Failed to re-register Ascend shared "
-                                       "memory during reconnection";
-                                all_registered = false;
-                                break;
-                            }
-                        } else if (register_shm_via_ipc(
-                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
-                            LOG(WARNING)
-                                << "Failed to re-register shared memory "
-                                   "during reconnection";
-                            all_registered = false;
-                            break;
-                        }
-                    }
-                }
-
-#if defined(USE_ASCEND_DIRECT)
-                if (all_registered && globalConfig().ascend_agent_mode) {
-                    if (globalConfig().ascend_use_fabric_mem &&
-                        reregister_fabric_buffers() != 0) {
-                        LOG(WARNING) << "Failed to re-register Fabric buffers "
-                                        "during reconnection";
-                        all_registered = false;
-                    }
-                    if (all_registered && reregister_device_buffers() != 0) {
-                        LOG(WARNING) << "Failed to re-register device buffers "
-                                        "during reconnection";
-                        all_registered = false;
-                    }
-                }
-#endif
-
-                if (all_registered) {
-                    LOG(INFO)
-                        << "Re-registered all shared memorys successfully";
-
-                    // Try to validate RPC connection
-                    // Even if register_shm_via_ipc succeeded, we should check
-                    // if RPC is responsive
-                    auto check_rpc =
-                        invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
-                    if (check_rpc.has_value() &&
-                        check_rpc.value().client_status == ClientStatus::OK) {
-                        LOG(INFO) << "RPC connection restored";
-                        ping_fail_count = 0;
-                        connected_.store(true);
-                        break;  // Exit reconnection loop
-                    }
-                }
-
-                LOG(WARNING) << "Reconnection attempt failed, retrying in "
-                             << retry_connect_interval_ms << "ms";
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(retry_connect_interval_ms));
-            }
+            reconnect();
         } else {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(fail_ping_interval_ms));

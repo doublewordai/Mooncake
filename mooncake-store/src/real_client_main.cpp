@@ -1,5 +1,7 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "allocator_status.h"
@@ -9,6 +11,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "uds_transport.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -31,6 +34,16 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
+DEFINE_string(ipc_socket_path, "",
+              "Unix socket used to receive shared-memory fds from dummy "
+              "clients. A path starting with '/' creates a filesystem socket "
+              "(e.g. /run/mooncake/client.sock) that other pods on the node "
+              "can reach through a shared mount. Empty falls back to env "
+              "MOONCAKE_IPC_SOCKET_PATH, then to the abstract socket "
+              "@mooncake_client_<port>.sock.");
+DEFINE_string(ipc_socket_mode, "0660",
+              "Octal permission mode applied to a filesystem "
+              "--ipc_socket_path. Ignored for abstract sockets.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -93,6 +106,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::get_instance_id_internal>(
+        &real_client);
     server.register_handler<&RealClient::acquire_hot_cache>(&real_client);
     server.register_handler<&RealClient::release_hot_cache>(&real_client);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&real_client);
@@ -140,12 +155,46 @@ int main(int argc, char *argv[]) {
     globalConfig().ascend_agent_mode = true;
 #endif
 
+    std::string ipc_socket_path = FLAGS_ipc_socket_path;
+    if (ipc_socket_path.empty()) {
+        const char *env_path = std::getenv("MOONCAKE_IPC_SOCKET_PATH");
+        if (env_path != nullptr) ipc_socket_path = env_path;
+    }
+    if (ipc_socket_path.empty()) {
+        ipc_socket_path =
+            "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock";
+    }
+
+    char *mode_end = nullptr;
+    unsigned long ipc_socket_mode =
+        std::strtoul(FLAGS_ipc_socket_mode.c_str(), &mode_end, 8);
+    if (FLAGS_ipc_socket_mode.empty() || *mode_end != '\0' ||
+        ipc_socket_mode > 0777) {
+        LOG(FATAL) << "Invalid --ipc_socket_mode '" << FLAGS_ipc_socket_mode
+                   << "': expected an octal mode such as 0660";
+        return -1;
+    }
+
+    if (isFilesystemUdsPath(ipc_socket_path)) {
+        LOG(INFO) << "IPC socket: filesystem path " << ipc_socket_path
+                  << " (mode " << FLAGS_ipc_socket_mode << ")";
+    } else {
+        LOG(INFO) << "IPC socket: abstract name " << ipc_socket_path;
+    }
+
     auto client_inst = RealClient::create();
+    {
+        char id_str[17];
+        snprintf(id_str, sizeof(id_str), "%016llx",
+                 static_cast<unsigned long long>(client_inst->instance_id()));
+        LOG(INFO) << "Real client instance id: " << id_str;
+    }
+    client_inst->set_ipc_socket_mode(
+        static_cast<unsigned int>(ipc_socket_mode));
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size,
         local_buffer_size, FLAGS_protocol, FLAGS_device_names,
-        FLAGS_master_server_address, nullptr,
-        "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
+        FLAGS_master_server_address, nullptr, ipc_socket_path, FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
         FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {

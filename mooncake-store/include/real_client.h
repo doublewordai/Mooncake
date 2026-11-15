@@ -116,6 +116,10 @@ class RealClient : public PyClient {
         return -1;
     };
 
+    // Permission bits applied to a filesystem IPC socket (one whose path
+    // starts with '/'). Must be called before setup. Default 0660.
+    void set_ipc_socket_mode(unsigned int mode) { ipc_socket_mode_ = mode; }
+
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
@@ -923,6 +927,12 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    // Random value fixed for the life of this process. A DummyClient compares
+    // it across pings to notice a restarted RealClient at the same address,
+    // even when the restart is faster than one ping interval.
+    tl::expected<uint64_t, ErrorCode> get_instance_id_internal();
+    uint64_t instance_id() const { return instance_id_; }
+
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
@@ -1224,6 +1234,7 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+    const uint64_t instance_id_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
@@ -1332,6 +1343,7 @@ class RealClient : public PyClient {
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
+    unsigned int ipc_socket_mode_ = 0660;
     std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();

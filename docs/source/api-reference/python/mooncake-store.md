@@ -1227,13 +1227,19 @@ hosts with RDMA HCAs to select MNNVL instead of RDMA.
 Initialize the store with a dummy client for testing purposes.
 
 ```python
-def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str) -> int
+def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str, ipc_socket_path: str = "") -> int
 ```
 
 **Parameters:**
 - `mem_pool_size` (int): Memory pool size in bytes
 - `local_buffer_size` (int): Local buffer size in bytes
 - `server_address` (str): Server address in format "hostname:port"
+- `ipc_socket_path` (str): Unix socket used to hand the shared-memory fd to the
+  real client. Defaults to `""`, which uses the `MOONCAKE_IPC_SOCKET_PATH`
+  environment variable if set, and otherwise the abstract socket
+  `@mooncake_client_<port>.sock`. It must match the real client's
+  `--ipc_socket_path`; see
+  [IPC socket for dummy clients](../../deployment/mooncake-store-deployment-guide.md#ipc-socket-for-dummy-clients).
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)

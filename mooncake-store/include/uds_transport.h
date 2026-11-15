@@ -9,9 +9,16 @@
 #include <string>
 #include <thread>
 
+#include <sys/types.h>
+
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
+
+// Socket names that start with '/' are bound as filesystem Unix sockets at
+// that path. Any other name is bound in the abstract namespace, which is
+// scoped to the network namespace of the process.
+bool isFilesystemUdsPath(const std::string &socket_name);
 
 // Lightweight Unix domain socket helper for one-shot, performance-insensitive
 // control-plane exchanges such as local fd passing. This opens short-lived
@@ -61,7 +68,8 @@ class UdsAcceptor {
    public:
     using Handler = std::function<void(UdsConnection &)>;
 
-    explicit UdsAcceptor(std::string socket_name);
+    // socket_mode is applied with chmod() to filesystem sockets only.
+    explicit UdsAcceptor(std::string socket_name, mode_t socket_mode = 0660);
     ~UdsAcceptor();
 
     void registerHandler(Handler handler);
@@ -71,8 +79,15 @@ class UdsAcceptor {
    private:
     void acceptLoop();
     void wakeAccept();
+    void unlinkBoundSocketFile();
 
     std::string socket_name_;
+    mode_t socket_mode_;
+    // Identity of the socket file this acceptor created, so stop() never
+    // unlinks a file that another process has since bound at the same path.
+    bool bound_socket_file_ = false;
+    dev_t bound_dev_ = 0;
+    ino_t bound_ino_ = 0;
     Handler handler_;
     int listen_fd_ = -1;
     std::atomic<int> active_client_fd_{-1};

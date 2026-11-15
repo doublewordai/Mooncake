@@ -4,12 +4,15 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <utility>
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -50,6 +53,29 @@ tl::expected<void, std::string> makeAbstractAddress(
     return {};
 }
 
+tl::expected<void, std::string> makeFilesystemAddress(
+    const std::string &socket_path, sockaddr_un &addr, socklen_t &addr_len) {
+    // sun_path must hold the path plus its NUL terminator.
+    if (socket_path.size() >= sizeof(addr.sun_path)) {
+        return tl::make_unexpected("UDS socket path too long: " + socket_path);
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, socket_path.c_str(), socket_path.size() + 1);
+    addr_len = offsetof(sockaddr_un, sun_path) + socket_path.size() + 1;
+    return {};
+}
+
+tl::expected<void, std::string> makeAddress(const std::string &socket_name,
+                                            sockaddr_un &addr,
+                                            socklen_t &addr_len) {
+    if (isFilesystemUdsPath(socket_name)) {
+        return makeFilesystemAddress(socket_name, addr, addr_len);
+    }
+    return makeAbstractAddress(socket_name, addr, addr_len);
+}
+
 tl::expected<void, std::string> setSendTimeout(
     int fd, std::chrono::milliseconds timeout) {
     timeval tv = {
@@ -80,7 +106,7 @@ tl::expected<int, std::string> createConnectedSocket(
 
     sockaddr_un addr;
     socklen_t addr_len = 0;
-    auto addr_result = makeAbstractAddress(socket_name, addr, addr_len);
+    auto addr_result = makeAddress(socket_name, addr, addr_len);
     if (!addr_result) {
         close(sock_fd);
         return tl::make_unexpected(addr_result.error());
@@ -112,7 +138,43 @@ tl::expected<int, std::string> createConnectedSocket(
     return sock_fd;
 }
 
+// Removes a leftover socket file from a previous run so bind() can succeed.
+// Only socket files are removed, and only when nothing is listening on them.
+tl::expected<void, std::string> removeStaleSocketFile(
+    const std::string &socket_path) {
+    struct stat st;
+    if (lstat(socket_path.c_str(), &st) < 0) {
+        if (errno == ENOENT) return {};
+        return tl::make_unexpected(errnoMessage(
+            "Failed to stat UDS socket path '" + socket_path + "'"));
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        return tl::make_unexpected(
+            "Refusing to replace non-socket file at "
+            "UDS socket path '" +
+            socket_path + "'");
+    }
+
+    auto probe = createConnectedSocket(socket_path, std::chrono::seconds(1));
+    if (probe) {
+        close(*probe);
+        return tl::make_unexpected("UDS socket path '" + socket_path +
+                                   "' is in use by another listener");
+    }
+
+    if (unlink(socket_path.c_str()) < 0 && errno != ENOENT) {
+        return tl::make_unexpected(errnoMessage(
+            "Failed to remove stale UDS socket '" + socket_path + "'"));
+    }
+    LOG(INFO) << "Removed stale UDS socket file " << socket_path;
+    return {};
+}
+
 }  // namespace
+
+bool isFilesystemUdsPath(const std::string &socket_name) {
+    return !socket_name.empty() && socket_name[0] == '/';
+}
 
 UdsConnection::UdsConnection(int fd) : fd_(fd) {}
 
@@ -262,8 +324,8 @@ UdsConnector::connect() {
     return std::make_unique<UdsConnection>(*fd);
 }
 
-UdsAcceptor::UdsAcceptor(std::string socket_name)
-    : socket_name_(std::move(socket_name)) {}
+UdsAcceptor::UdsAcceptor(std::string socket_name, mode_t socket_mode)
+    : socket_name_(std::move(socket_name)), socket_mode_(socket_mode) {}
 
 UdsAcceptor::~UdsAcceptor() { stop(); }
 
@@ -284,11 +346,21 @@ tl::expected<void, std::string> UdsAcceptor::start() {
 
     sockaddr_un addr;
     socklen_t addr_len = 0;
-    auto addr_result = makeAbstractAddress(socket_name_, addr, addr_len);
+    auto addr_result = makeAddress(socket_name_, addr, addr_len);
     if (!addr_result) {
         ::close(listen_fd_);
         listen_fd_ = -1;
         return tl::make_unexpected(addr_result.error());
+    }
+
+    const bool filesystem = isFilesystemUdsPath(socket_name_);
+    if (filesystem) {
+        auto remove_result = removeStaleSocketFile(socket_name_);
+        if (!remove_result) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return tl::make_unexpected(remove_result.error());
+        }
     }
 
     if (bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
@@ -299,12 +371,43 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected(error);
     }
 
+    if (filesystem) {
+        struct stat st;
+        if (stat(socket_name_.c_str(), &st) == 0) {
+            bound_socket_file_ = true;
+            bound_dev_ = st.st_dev;
+            bound_ino_ = st.st_ino;
+        }
+        // chmod before listen() so no client can connect under the
+        // umask-derived mode.
+        if (chmod(socket_name_.c_str(), socket_mode_) < 0) {
+            auto error = errnoMessage("Failed to chmod UDS socket '" +
+                                      socket_name_ + "'");
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            unlinkBoundSocketFile();
+            return tl::make_unexpected(error);
+        }
+    }
+
     if (listen(listen_fd_, 5) < 0) {
         auto error = errnoMessage("Failed to listen on UDS socket '" +
                                   socket_name_ + "'");
         ::close(listen_fd_);
         listen_fd_ = -1;
+        unlinkBoundSocketFile();
         return tl::make_unexpected(error);
+    }
+
+    if (filesystem) {
+        char mode_str[8];
+        snprintf(mode_str, sizeof(mode_str), "%04o",
+                 static_cast<unsigned>(socket_mode_));
+        LOG(INFO) << "UDS acceptor listening on filesystem socket "
+                  << socket_name_ << " (mode " << mode_str << ")";
+    } else {
+        LOG(INFO) << "UDS acceptor listening on abstract socket "
+                  << socket_name_;
     }
 
     running_ = true;
@@ -324,6 +427,17 @@ void UdsAcceptor::stop() {
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
+    }
+    unlinkBoundSocketFile();
+}
+
+void UdsAcceptor::unlinkBoundSocketFile() {
+    if (!bound_socket_file_) return;
+    bound_socket_file_ = false;
+    struct stat st;
+    if (lstat(socket_name_.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == bound_dev_ && st.st_ino == bound_ino_) {
+        ::unlink(socket_name_.c_str());
     }
 }
 

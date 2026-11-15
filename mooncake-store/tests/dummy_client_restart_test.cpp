@@ -130,13 +130,16 @@ class DummyClientRestartTest : public ::testing::Test {
     std::string ipc_path_;
 };
 
-TEST_F(DummyClientRestartTest, FastRestartIsDetectedByInstanceId) {
+// End-to-end regression: a zero-gap restart at the same address must end in
+// a working dummy. In-process the restart also breaks the pooled RPC
+// connection, so this can recover through the ping-failure path as well as
+// through the instance id; the test below pins down the new trigger.
+TEST_F(DummyClientRestartTest, FastRestartRecovers) {
     ASSERT_TRUE(SetupStack(/*with_instance_id=*/true));
     ASSERT_EQ(Put("before"), 0);
 
     FastRestart(/*with_instance_id=*/true);
 
-    // Without detection the dummy never re-registers and every put fails.
     double recovered = SecondsUntilPutSucceeds("after-", 10.0);
     ASSERT_GE(recovered, 0) << "dummy never recovered after a fast restart";
     LOG(INFO) << "recovered " << recovered << " s after the restart";
@@ -146,23 +149,36 @@ TEST_F(DummyClientRestartTest, FastRestartIsDetectedByInstanceId) {
     }
 }
 
-TEST_F(DummyClientRestartTest, ClientNotFoundTriggersReregistration) {
-    // A RealClient without the instance-id RPC (as from an older build):
-    // detection then relies on data-path RPCs answering CLIENT_NOT_FOUND.
-    ASSERT_TRUE(SetupStack(/*with_instance_id=*/false));
+// The RealClient drops the dummy's mappings while the connection, the ping
+// and the instance id all stay the same: only the CLIENT_NOT_FOUND answer can
+// tell the dummy, and it must re-register without waiting for a failed ping.
+class DummyClientForgottenTest : public DummyClientRestartTest,
+                                 public ::testing::WithParamInterface<bool> {};
+
+TEST_P(DummyClientForgottenTest, ClientNotFoundTriggersReregistration) {
+    const bool with_instance_id = GetParam();
+    ASSERT_TRUE(SetupStack(with_instance_id));
     ASSERT_EQ(Put("before"), 0);
 
-    FastRestart(/*with_instance_id=*/false);
+    ASSERT_TRUE(real_client_->unmap_shm_internal(dummy_client_->client_id())
+                    .has_value());
 
-    EXPECT_EQ(Put("first-after"), static_cast<int>(ErrorCode::CLIENT_NOT_FOUND))
+    EXPECT_EQ(Put("first-after"), toInt(ErrorCode::CLIENT_NOT_FOUND))
         << "an unknown client_id must be reported as CLIENT_NOT_FOUND";
-    double recovered = SecondsUntilPutSucceeds("after-", 10.0);
+    double recovered = SecondsUntilPutSucceeds("after-", 5.0);
     ASSERT_GE(recovered, 0) << "CLIENT_NOT_FOUND did not trigger recovery";
+    // Well inside the 1 s ping interval: the trigger, not a ping, did it.
+    EXPECT_LT(recovered, 1.0);
     for (int i = 0; i < 20; ++i) {
         EXPECT_EQ(Put("steady-" + std::to_string(i)), 0)
             << "put failed after recovery";
     }
 }
+
+// true: current RealClient; false: one without get_instance_id_internal, as
+// from an older build (the mixed-version case).
+INSTANTIATE_TEST_SUITE_P(WithAndWithoutInstanceId, DummyClientForgottenTest,
+                         ::testing::Bool());
 
 }  // namespace testing
 }  // namespace mooncake

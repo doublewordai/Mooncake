@@ -212,6 +212,8 @@ class DummyClient : public PyClient {
 
     int health_check() override;
 
+    const UUID &client_id() const { return client_id_; }
+
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
 

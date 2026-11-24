@@ -930,7 +930,12 @@ class MooncakeStorePyWrapper {
         std::vector<std::vector<std::vector<int64_t>>> results;
         {
             py::gil_scoped_release release_gil;
+#ifdef WITH_SECURE_KV
+            // Secure mode has no RealClient; store_ is the decorator.
             results = snapshot ? store_->get_into_ranges_from_snapshot(
+#else
+            results = snapshot ? real_client_->get_into_ranges_from_snapshot(
+#endif
                                      buffers, all_keys, all_dst_offsets,
                                      all_src_offsets, all_sizes, *snapshot)
                                : store_->get_into_ranges(
@@ -1054,7 +1059,12 @@ class MooncakeStorePyWrapper {
             std::vector<std::vector<std::vector<int64_t>>> range_results;
             {
                 py::gil_scoped_release release_gil;
+#ifdef WITH_SECURE_KV
+                // Secure mode has no RealClient; store_ is the decorator.
                 range_results = store_->get_into_ranges_from_snapshot(
+#else
+                range_results = real_client_->get_into_ranges_from_snapshot(
+#endif
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
                     all_sizes, snapshot);
             }
@@ -1332,13 +1342,15 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<void *>> &buffers,
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                // Without a RealClient (secure mode) the PyClient call is
-                // the decorator's sealing path.
-                return real_client_ ? real_client_->batch_put_from_multi_buffers(
-                                          write_keys, buffers, sizes,
-                                          write_config, true)
-                                    : store_->batch_put_from_multi_buffers(write_keys, buffers,
-                                                        sizes, write_config);
+#ifdef WITH_SECURE_KV
+                // Secure mode has no RealClient: take the decorator's sealing
+                // path.
+                if (!real_client_)
+                    return store_->batch_put_from_multi_buffers(write_keys, buffers, sizes,
+                                      write_config);
+#endif
+                return real_client_->batch_put_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config, true);
             });
     }
 
@@ -1363,13 +1375,15 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<void *>> &buffers,
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                // Without a RealClient (secure mode) the PyClient call is
-                // the decorator's sealing path.
-                return real_client_ ? real_client_->batch_upsert_from_multi_buffers(
-                                          write_keys, buffers, sizes,
-                                          write_config, true)
-                                    : store_->batch_upsert_from_multi_buffers(write_keys, buffers,
-                                                        sizes, write_config);
+#ifdef WITH_SECURE_KV
+                // Secure mode has no RealClient: take the decorator's sealing
+                // path.
+                if (!real_client_)
+                    return store_->batch_upsert_from_multi_buffers(write_keys, buffers, sizes,
+                                      write_config);
+#endif
+                return real_client_->batch_upsert_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config, true);
             });
     }
 

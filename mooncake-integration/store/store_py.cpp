@@ -13,6 +13,9 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#ifdef WITH_SECURE_KV
+#include "secure/secure_py_client.h"
+#endif
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
@@ -545,9 +548,29 @@ class MooncakeStorePyWrapper {
         use_dummy_client_ = false;
         store_ = real_client;
         real_client_ = real_client;
+#ifdef WITH_SECURE_KV
+        // Secure mode: every Python data call goes through the sealing
+        // decorator, and nothing can reach the RealClient around it.
+        if (secure::SecurePyClient::Enabled()) {
+            store_ = std::make_shared<secure::SecurePyClient>(real_client);
+            real_client_ = nullptr;
+        }
+#endif
         resource_tracker.registerInstance(
             std::static_pointer_cast<PyClient>(store_));
         return real_client;
+    }
+
+    // Runs a RealClient setup; in secure mode, through the decorator.
+    int run_setup(const std::function<int()> &setup, bool external_engine,
+                  bool ssd_offload) {
+#ifdef WITH_SECURE_KV
+        if (auto s = std::dynamic_pointer_cast<secure::SecurePyClient>(store_))
+            return s->SetupInner(setup, external_engine, ssd_offload);
+#endif
+        (void)external_engine;
+        (void)ssd_offload;
+        return setup();
     }
 
     bool is_client_initialized() const {
@@ -907,7 +930,7 @@ class MooncakeStorePyWrapper {
         std::vector<std::vector<std::vector<int64_t>>> results;
         {
             py::gil_scoped_release release_gil;
-            results = snapshot ? real_client_->get_into_ranges_from_snapshot(
+            results = snapshot ? store_->get_into_ranges_from_snapshot(
                                      buffers, all_keys, all_dst_offsets,
                                      all_src_offsets, all_sizes, *snapshot)
                                : store_->get_into_ranges(
@@ -1031,7 +1054,7 @@ class MooncakeStorePyWrapper {
             std::vector<std::vector<std::vector<int64_t>>> range_results;
             {
                 py::gil_scoped_release release_gil;
-                range_results = real_client_->get_into_ranges_from_snapshot(
+                range_results = store_->get_into_ranges_from_snapshot(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
                     all_sizes, snapshot);
             }
@@ -1309,8 +1332,13 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<void *>> &buffers,
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                return real_client_->batch_put_from_multi_buffers(
-                    write_keys, buffers, sizes, write_config, true);
+                // Without a RealClient (secure mode) the PyClient call is
+                // the decorator's sealing path.
+                return real_client_ ? real_client_->batch_put_from_multi_buffers(
+                                          write_keys, buffers, sizes,
+                                          write_config, true)
+                                    : store_->batch_put_from_multi_buffers(write_keys, buffers,
+                                                        sizes, write_config);
             });
     }
 
@@ -1335,8 +1363,13 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<void *>> &buffers,
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                return real_client_->batch_upsert_from_multi_buffers(
-                    write_keys, buffers, sizes, write_config, true);
+                // Without a RealClient (secure mode) the PyClient call is
+                // the decorator's sealing path.
+                return real_client_ ? real_client_->batch_upsert_from_multi_buffers(
+                                          write_keys, buffers, sizes,
+                                          write_config, true)
+                                    : store_->batch_upsert_from_multi_buffers(write_keys, buffers,
+                                                        sizes, write_config);
             });
     }
 
@@ -2460,15 +2493,21 @@ PYBIND11_MODULE(_store, m) {
                 int ret;
                 {
                     py::gil_scoped_release release;
-                    auto result = real_client->setup_internal(
-                        local_hostname, metadata_server, global_segment_size,
-                        local_buffer_size, protocol, rdma_devices,
-                        master_server_addr, transfer_engine, "", 50052,
-                        enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                        enable_client_http_server, client_http_port,
-                        enable_embedded_master);
-                    ret = result.has_value() ? 0
-                                             : static_cast<int>(result.error());
+                    ret = self.run_setup(
+                        [&] {
+                            auto result = real_client->setup_internal(
+                                local_hostname, metadata_server,
+                                global_segment_size, local_buffer_size,
+                                protocol, rdma_devices, master_server_addr,
+                                transfer_engine, "", 50052, enable_ssd_offload,
+                                true, ssd_offload_path, tenant_id,
+                                enable_client_http_server, client_http_port,
+                                enable_embedded_master);
+                            return result.has_value()
+                                       ? 0
+                                       : static_cast<int>(result.error());
+                        },
+                        transfer_engine != nullptr, enable_ssd_offload);
                 }
                 return ret;
             },
@@ -2497,9 +2536,14 @@ PYBIND11_MODULE(_store, m) {
                 int ret;
                 {
                     py::gil_scoped_release release;
-                    auto result = real_client->setup_internal(config);
-                    ret = result.has_value() ? 0
-                                             : static_cast<int>(result.error());
+                    ret = self.run_setup(
+                        [&] {
+                            auto result = real_client->setup_internal(config);
+                            return result.has_value()
+                                       ? 0
+                                       : static_cast<int>(result.error());
+                        },
+                        false, false);
                 }
                 return ret;
             },

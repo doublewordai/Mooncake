@@ -259,6 +259,34 @@ TEST(CryptoTest2, ForkedChildDrawsANewSalt) {
     EXPECT_NE(child_salt, pi.salt);
 }
 
+// Regression: the HKDF info had an uninitialised trailing byte, so a subkey
+// depended on stack contents and a message sealed on one thread (or process)
+// failed to open on another. The info is exactly label | algorithm | purpose.
+TEST(CryptoTest2, SubkeyIsAFunctionOfItsInputsOnly) {
+    auto key = TestKey(1);
+    MasterKey master(DeriveKeyId(key.data()), key.data());
+    std::array<uint8_t, kSaltSize> salt;
+    for (size_t i = 0; i < kSaltSize; ++i) salt[i] = static_cast<uint8_t>(i);
+    std::array<uint8_t, kKeySize> here{}, there{};
+    ASSERT_EQ(DeriveSubkey(master, salt.data(), Algorithm::kAes256Gcm,
+                           Purpose::kTransfer, &here),
+              Error::kOk);
+    std::thread([&] {
+        volatile uint8_t dirty[4096];
+        for (size_t i = 0; i < sizeof(dirty); ++i) dirty[i] = 0xA5;
+        ASSERT_EQ(DeriveSubkey(master, salt.data(), Algorithm::kAes256Gcm,
+                               Purpose::kTransfer, &there),
+                  Error::kOk);
+    }).join();
+    EXPECT_EQ(here, there);
+    // HKDF-SHA256(key, salt, "mooncake-secure-v1" | 0x01 | 0x02).
+    const uint8_t expected[kKeySize] = {
+        0x09, 0x8b, 0x56, 0xc7, 0x2c, 0xde, 0xce, 0xf0, 0x96, 0x18, 0x9f,
+        0xd2, 0x38, 0xb8, 0x06, 0x93, 0x76, 0x9b, 0x0f, 0x46, 0x09, 0x39,
+        0xe7, 0x58, 0x9a, 0x58, 0x43, 0xae, 0xc0, 0xa5, 0x1d, 0xa3};
+    EXPECT_EQ(memcmp(here.data(), expected, kKeySize), 0);
+}
+
 TEST(CryptoTest2, RotationAcceptsPreviousKey) {
     auto old_ring = Ring({9});
     auto new_ring = Ring({10, 9});  // new current, old previous

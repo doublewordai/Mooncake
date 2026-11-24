@@ -563,7 +563,8 @@ Error DeriveSubkey(const MasterKey& master, const uint8_t salt[kSaltSize],
                    std::array<uint8_t, kKeySize>* out) {
     EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
     if (!pctx) return Error::kCryptoError;
-    uint8_t info[sizeof(kHkdfLabel) + 2];
+    // label (without its NUL) | algorithm | purpose: every byte defined.
+    uint8_t info[sizeof(kHkdfLabel) + 1];
     std::memcpy(info, kHkdfLabel, sizeof(kHkdfLabel) - 1);
     info[sizeof(kHkdfLabel) - 1] = static_cast<uint8_t>(alg);
     info[sizeof(kHkdfLabel)] = static_cast<uint8_t>(purpose);

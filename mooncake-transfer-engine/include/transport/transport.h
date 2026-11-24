@@ -38,6 +38,11 @@ namespace mooncake {
 
 class RdmaEndPoint;
 class TransferMetadata;
+#ifdef WITH_SECURE_KV
+namespace secure {
+class SecureTransport;
+}
+#endif
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
 /// failure.
@@ -45,6 +50,9 @@ class Transport {
     friend class TransferEngine;
     friend class TransferEngineImpl;
     friend class MultiTransport;
+#ifdef WITH_SECURE_KV
+    friend class secure::SecureTransport;
+#endif
 
    public:
     using SegmentID = uint64_t;

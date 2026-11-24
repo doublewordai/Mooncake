@@ -610,3 +610,11 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+if(WITH_SECURE_KV)
+  foreach(t kv_crypto_test secure_transport_test)
+    add_executable(${t} ${WORKSPACE}/secure/${t}.cpp)
+    target_link_libraries(${t} PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME ${t} COMMAND ${t})
+  endforeach()
+endif()

@@ -98,6 +98,12 @@ TEST_F(SecureTransportTest, OnlyCiphertextMemoryIsPublished) {
     ASSERT_EQ(engine_->registerLocalMemory(user.data(), user.size(), "cpu:0"),
               0);
     EXPECT_FALSE(Published(user.data()));
+    // Registering local-only memory brings up the secure push receiver,
+    // whose receive staging is published.
+    ASSERT_TRUE(dynamic_cast<SecureTransport*>(xport_)
+                    ->push_service()
+                    ->receiver_enabled());
+    const size_t before = PublishedBuffers();
 
     StagingPool pool(
         1 << 20, 8 << 20,
@@ -109,7 +115,7 @@ TEST_F(SecureTransportTest, OnlyCiphertextMemoryIsPublished) {
     auto a = pool.Allocate(4096);
     auto b = pool.Allocate(4096);
     ASSERT_TRUE(a && b);
-    EXPECT_EQ(PublishedBuffers(), 1u);  // the staging region only
+    EXPECT_EQ(PublishedBuffers(), before + 1);  // the staging region only
 
     auto* st = dynamic_cast<SecureTransport*>(xport_);
     EXPECT_TRUE(st->IsCiphertextMemory(a.data(), 4096));
@@ -121,8 +127,9 @@ TEST_F(SecureTransportTest, OnlyCiphertextMemoryIsPublished) {
     ASSERT_TRUE(Write(a.data(), b.data(), 4096).ok());
     EXPECT_EQ(static_cast<uint8_t*>(b.data())[4095], 0x5c);
 
-    // A transfer from local-only memory is refused before it reaches the
-    // fabric.
+    // A write from local-only memory becomes a secure push, which the
+    // receiver refuses because the destination is ciphertext memory, not
+    // local-only memory.
     Status s = Write(user.data(), b.data(), 4096);
     EXPECT_FALSE(s.ok());
     EXPECT_EQ(static_cast<uint8_t*>(b.data())[0], 0x5c);

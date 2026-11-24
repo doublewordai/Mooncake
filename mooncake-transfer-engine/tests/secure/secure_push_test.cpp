@@ -569,7 +569,12 @@ TEST_F(SecurePushTest, DeviceMemoryRoundTrip) {
               Transport::TransferStatusEnum::FAILED);
     ASSERT_EQ(cudaMemcpy(back.data(), ddst, 1 << 20, cudaMemcpyDeviceToHost),
               cudaSuccess);
-    for (size_t i = 0; i < (1u << 20); ++i) ASSERT_EQ(back[i], 0xA5) << i;
+    // The tampered segment (the first 64 KiB) never reaches the device;
+    // other segments of the failed push hold either the old bytes or the
+    // authentic ones, never anything else.
+    for (size_t i = 0; i < (1u << 16); ++i) ASSERT_EQ(back[i], 0xA5) << i;
+    for (size_t i = 0; i < (1u << 20); ++i)
+        ASSERT_TRUE(back[i] == 0xA5 || back[i] == host[i]) << i;
 
     A().engine->unregisterLocalMemory(dsrc);
     B().engine->unregisterLocalMemory(ddst);

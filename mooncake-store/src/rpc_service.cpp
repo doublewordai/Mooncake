@@ -1876,7 +1876,7 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
                             WrappedMasterService& service,
                             RpcWorkerPool* worker_pool) {
     if (worker_pool == nullptr) {
-        server.register_handler<Methods...>(&service);
+        RpcRegistrar(server).register_handler<Methods...>(&service);
         return;
     }
     (worker_pool->Register<Methods>(server, service), ...);
@@ -1887,9 +1887,10 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool) {
-    server.register_handler<&WrappedMasterService::Ping,
-                            &WrappedMasterService::ServiceReady>(
-        &wrapped_master_service);
+    RpcRegistrar(server)
+        .register_handler<&WrappedMasterService::Ping,
+                          &WrappedMasterService::ServiceReady>(
+            &wrapped_master_service);
     RegisterPooledHandlers<
         &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
         &WrappedMasterService::BatchQueryIp,

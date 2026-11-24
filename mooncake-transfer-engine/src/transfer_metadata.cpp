@@ -30,6 +30,9 @@
 #include "config.h"
 #include "error.h"
 #include "transfer_metadata_plugin.h"
+#ifdef MOONCAKE_WITH_SECURE_KV
+#include "handshake_auth.h"
+#endif
 
 namespace mooncake {
 // Process-lifetime intern pool for RDMA NIC paths. Entries are never erased
@@ -311,6 +314,9 @@ struct TransferHandshakeUtil {
 };
 
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
+#ifdef MOONCAKE_WITH_SECURE_KV
+    secure::OnTransferMetadataCreated(conn_string);
+#endif
     next_segment_id_.store(1);
 
     std::string protocol = extractProtocolFromConnString(conn_string);

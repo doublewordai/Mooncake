@@ -38,6 +38,14 @@ int64_t NowMs() {
         .count();
 }
 
+// Sends a request and waits for its response.
+template <typename T>
+async_simple::coro::Lazy<T> Flatten(
+    async_simple::coro::Lazy<async_simple::coro::Lazy<T>> outer) {
+    auto inner = co_await std::move(outer);
+    co_return co_await std::move(inner);
+}
+
 class Store {
    public:
     int Put(std::string key) {
@@ -88,18 +96,16 @@ class RpcAuthTest : public ::testing::Test {
     // Sends Put with a chosen attachment; returns the coro_rpc error code.
     uint16_t PutWith(coro_rpc::coro_rpc_client &client,
                      std::string_view attachment) {
-        auto inner = syncAwait(client.send_request_with_attachment<&Store::Put>(
-            attachment, std::string("k")));
-        auto r = syncAwait(std::move(inner));
+        auto r = syncAwait(Flatten(client.send_request_with_attachment<&Store::Put>(
+            attachment, std::string("k"))));
         return r ? 0 : static_cast<uint16_t>(r.error().code.ec);
     }
 
     // A request through the client seam, as the Store's clients send them.
     template <auto Method, typename... Args>
     auto AuthedCall(coro_rpc::coro_rpc_client &client, Args &&...args) {
-        auto inner = syncAwait(
-            RpcSendRequest<Method>(client, std::forward<Args>(args)...));
-        return syncAwait(std::move(inner));
+        return syncAwait(Flatten(
+            RpcSendRequest<Method>(client, std::forward<Args>(args)...)));
     }
 
     int port_ = 0;

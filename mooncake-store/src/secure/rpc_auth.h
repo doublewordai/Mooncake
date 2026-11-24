@@ -104,6 +104,7 @@ class DirectInvoker<Method, Service, std::tuple<Params...>> {
             }
         } else if constexpr (std::is_void_v<Result>) {
             (service_->*Method)(std::move(params)...);
+            co_return;
         } else {
             co_return(service_->*Method)(std::move(params)...);
         }

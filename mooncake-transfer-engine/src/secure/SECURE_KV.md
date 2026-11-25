@@ -113,6 +113,21 @@ in total) separately from authenticated ones. Both are described, with their
 `MC_SECURE_P2D_*` limits, in
 [`include/secure/secure_push.h`](../../include/secure/secure_push.h).
 
+## Secure push placement and timings
+
+A push leaves through the NIC its send staging is registered on, and lands
+through the NIC of the receiver's staging. Each process stages on one NUMA
+node, by default the node of the GPU it pushes from or receives into, and
+registers its staging as that node's memory, so it goes out on the NIC the
+engine uses for that GPU and every rank of a node keeps its own NIC, memory
+and cores. Its crypto threads run on that node's CPUs. The stage timings
+(device copies, seal, fabric write, commit round trip, open) are kept as
+counters and histograms (`SecurePushService::push_stats()`), summarised in
+the log at most once per interval and per push at `VLOG(1)`. Settings
+(`MC_SECURE_P2D_NUMA_NODE`, `MC_SECURE_P2D_CPUS`,
+`MC_SECURE_P2D_STATS_INTERVAL_S`) are in
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h).
+
 ## What secure mode refuses
 
 - Metadata other than `P2PHANDSHAKE` (etcd, redis, HTTP): the engine aborts at

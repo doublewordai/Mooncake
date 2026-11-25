@@ -84,6 +84,43 @@ size_t EnvSize(const char* name, size_t def) {
     return static_cast<size_t>(x);
 }
 
+uint64_t NsSince(Clock::time_point t0) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0)
+            .count());
+}
+
+void AtomicMax(std::atomic<uint64_t>& m, uint64_t v) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur &&
+           !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+// A sum and a maximum, for one push's breakdown.
+struct SumMax {
+    std::atomic<uint64_t> sum{0}, max{0};
+    void Add(uint64_t ns) {
+        sum.fetch_add(ns, std::memory_order_relaxed);
+        AtomicMax(max, ns);
+    }
+    void Reset() {
+        sum.store(0, std::memory_order_relaxed);
+        max.store(0, std::memory_order_relaxed);
+    }
+};
+
+std::string Ms(uint64_t ns) {
+    char b[32];
+    snprintf(b, sizeof(b), "%.2f", ns / 1e6);
+    return b;
+}
+
+std::string Ms(const SumMax& v) {
+    return Ms(v.sum.load(std::memory_order_relaxed)) + "/" +
+           Ms(v.max.load(std::memory_order_relaxed));
+}
+
 // ------------------------------------------------------------- encoding --
 
 class Writer {
@@ -509,6 +546,25 @@ PushOptions PushOptions::FromEnv() {
     o.idle_timeout_ms = static_cast<int>(std::min<size_t>(
         86400000, std::max<size_t>(100, EnvSize("MC_SECURE_P2D_IDLE_TIMEOUT_MS",
                                                 o.idle_timeout_ms))));
+    if (const char* v = getenv("MC_SECURE_P2D_NUMA_NODE"); v && *v) {
+        const std::string t(v);
+        char* end = nullptr;
+        const long node = strtol(v, &end, 10);
+        if (t == "auto") {
+            o.numa_node = PushOptions::kNumaAuto;
+        } else if (t == "none" || t == "off") {
+            o.numa_node = PushOptions::kNumaNone;
+        } else if (end != v && *end == '\0' && node >= 0 && node < 256) {
+            o.numa_node = static_cast<int>(node);
+        } else {
+            LOG(WARNING) << "secure push: ignoring malformed "
+                            "MC_SECURE_P2D_NUMA_NODE="
+                         << v << " (auto)";
+        }
+    }
+    o.stats_interval_s = static_cast<int>(std::min<size_t>(
+        86400, EnvSize("MC_SECURE_P2D_STATS_INTERVAL_S",
+                       static_cast<size_t>(o.stats_interval_s))));
     if (const char* h = getenv("MC_SECURE_P2D_HOST")) o.host = h;
     if (const char* c = getenv("MC_SECURE_P2D_CPUS")) {
         if (!ParseCpuList(c, &o.cpus)) {
@@ -523,8 +579,8 @@ PushOptions PushOptions::FromEnv() {
 // ----------------------------------------------------------- crypto pool --
 
 CryptoPool::CryptoPool(size_t threads, const std::vector<int>& cpus,
-                       const char* name)
-    : cpus_(cpus) {
+                       const char* name, bool each)
+    : cpus_(cpus), each_(each) {
     for (size_t i = 0; i < threads; ++i) {
         threads_.emplace_back([this, i] { Loop(i); });
         pthread_setname_np(threads_.back().native_handle(), name);
@@ -552,7 +608,12 @@ void CryptoPool::Loop(size_t index) {
     if (!cpus_.empty()) {
         cpu_set_t set;
         CPU_ZERO(&set);
-        CPU_SET(cpus_[index % cpus_.size()], &set);
+        if (each_) {
+            CPU_SET(cpus_[index % cpus_.size()], &set);
+        } else {
+            for (int c : cpus_)
+                if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+        }
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     }
     for (;;) {
@@ -567,6 +628,106 @@ void CryptoPool::Loop(size_t index) {
         fn();
     }
 }
+
+// ------------------------------------------------------------- telemetry --
+
+const char* PushStageName(PushStage s) {
+    switch (s) {
+        case PushStage::kD2H: return "d2h";
+        case PushStage::kSeal: return "seal";
+        case PushStage::kWrite: return "write";
+        case PushStage::kCommitRtt: return "commit_rtt";
+        case PushStage::kSealWait: return "wait_seal";
+        case PushStage::kWriteWait: return "wait_write";
+        case PushStage::kAckWait: return "wait_ack";
+        case PushStage::kPush: return "push";
+        case PushStage::kRxCopy: return "rx_copy";
+        case PushStage::kOpen: return "open";
+        case PushStage::kH2D: return "h2d";
+        default: return "?";
+    }
+}
+
+uint64_t StageStats::QuantileUpperUs(double q) const {
+    if (count == 0) return 0;
+    const double want = q * static_cast<double>(count);
+    uint64_t seen = 0;
+    for (int b = 0; b < kStageBuckets; ++b) {
+        seen += buckets[b];
+        if (static_cast<double>(seen) >= want && buckets[b])
+            return b == 0 ? 1 : (1ull << b);
+    }
+    return 1ull << (kStageBuckets - 1);
+}
+
+std::string PushStats::ToString() const {
+    std::string out = "pushes=" + std::to_string(pushes) +
+                      " failed=" + std::to_string(failed_pushes) +
+                      " bytes=" + std::to_string(bytes) +
+                      " rx_segments=" + std::to_string(rx_segments) +
+                      " node=" + std::to_string(numa_node);
+    for (int i = 0; i < static_cast<int>(PushStage::kCount); ++i) {
+        const StageStats& st = stage[i];
+        if (!st.count) continue;
+        char b[160];
+        snprintf(b, sizeof(b),
+                 " %s{n=%llu mean_us=%.0f max_us=%.0f p50_le_us=%llu "
+                 "p99_le_us=%llu}",
+                 PushStageName(static_cast<PushStage>(i)),
+                 static_cast<unsigned long long>(st.count),
+                 st.sum_ns / 1e3 / static_cast<double>(st.count),
+                 st.max_ns / 1e3,
+                 static_cast<unsigned long long>(st.QuantileUpperUs(0.5)),
+                 static_cast<unsigned long long>(st.QuantileUpperUs(0.99)));
+        out += b;
+    }
+    return out;
+}
+
+// Lock-free cumulative counters: a few relaxed atomic adds per segment.
+struct SecurePushService::Telemetry {
+    struct Stage {
+        std::atomic<uint64_t> count{0}, sum_ns{0}, max_ns{0};
+        std::atomic<uint64_t> buckets[kStageBuckets];
+        Stage() {
+            for (auto& b : buckets) b.store(0, std::memory_order_relaxed);
+        }
+    };
+    Stage stage[static_cast<int>(PushStage::kCount)];
+    std::atomic<uint64_t> pushes{0}, failed{0}, bytes{0}, rx_segments{0};
+    std::atomic<int64_t> last_summary_s{0};
+
+    static int Bucket(uint64_t ns) {
+        const uint64_t us = ns / 1000;
+        if (us == 0) return 0;
+        const int b = 64 - __builtin_clzll(us);
+        return std::min(b, kStageBuckets - 1);
+    }
+    void Record(PushStage s, uint64_t ns) {
+        Stage& st = stage[static_cast<int>(s)];
+        st.count.fetch_add(1, std::memory_order_relaxed);
+        st.sum_ns.fetch_add(ns, std::memory_order_relaxed);
+        AtomicMax(st.max_ns, ns);
+        st.buckets[Bucket(ns)].fetch_add(1, std::memory_order_relaxed);
+    }
+    PushStats Snapshot() const {
+        PushStats p;
+        for (int i = 0; i < static_cast<int>(PushStage::kCount); ++i) {
+            const Stage& st = stage[i];
+            p.stage[i].count = st.count.load(std::memory_order_relaxed);
+            p.stage[i].sum_ns = st.sum_ns.load(std::memory_order_relaxed);
+            p.stage[i].max_ns = st.max_ns.load(std::memory_order_relaxed);
+            for (int b = 0; b < kStageBuckets; ++b)
+                p.stage[i].buckets[b] =
+                    st.buckets[b].load(std::memory_order_relaxed);
+        }
+        p.pushes = pushes.load(std::memory_order_relaxed);
+        p.failed_pushes = failed.load(std::memory_order_relaxed);
+        p.bytes = bytes.load(std::memory_order_relaxed);
+        p.rx_segments = rx_segments.load(std::memory_order_relaxed);
+        return p;
+    }
+};
 
 // --------------------------------------------------------------- receiver --
 
@@ -876,6 +1037,10 @@ struct SecurePushService::Receiver {
         size_t outstanding = 0;  // commits being opened
         uint64_t lease_id = 0;
         bool failed = false;
+        // This lease's (push's) receive stages, for its VLOG(1) line.
+        SumMax copy, open, h2d;
+        std::atomic<uint64_t> segs{0}, bytes{0};
+        Clock::time_point first{};
     };
 
     // R.mu held. Sends every reply at the head of the queue that is ready.
@@ -888,6 +1053,23 @@ struct SecurePushService::Receiver {
             if (e->release) {
                 Release(R.lease_id);
                 R.lease_id = 0;
+                if (VLOG_IS_ON(1))
+                    VLOG(1) << "secure push rx: "
+                            << R.bytes.load(std::memory_order_relaxed)
+                            << " B in "
+                            << R.segs.load(std::memory_order_relaxed)
+                            << " segments in " << Ms(NsSince(R.first))
+                            << " ms since the first commit; sum/max ms: "
+                               "copy-out "
+                            << Ms(R.copy) << ", open " << Ms(R.open)
+                            << ", h2d " << Ms(R.h2d) << " (node "
+                            << svc->numa_node_ << ")";
+                R.copy.Reset();
+                R.open.Reset();
+                R.h2d.Reset();
+                R.segs.store(0, std::memory_order_relaxed);
+                R.bytes.store(0, std::memory_order_relaxed);
+                R.first = Clock::time_point{};
             }
             if (!R.failed && !Reply(fd, e->header, e->body)) R.failed = true;
             if (e->fatal) R.failed = true;
@@ -1067,12 +1249,33 @@ struct SecurePushService::Receiver {
                     std::lock_guard<std::mutex> lock(R.mu);
                     R.q.push_back(e);
                     ++R.outstanding;
+                    if (R.first == Clock::time_point{}) R.first = Clock::now();
                 }
                 for (size_t i = 0; i < job->segs.size(); ++i) {
                     open_pool->Run([this, job, i, fd, &R] {
+                        OpenTiming t;
                         if (!OpenSegment(job->segs[i], job->sender, job->tid,
-                                         job->total))
+                                         job->total, &t)) {
                             job->ok.store(false);
+                        } else {
+                            auto& tm = *svc->tm_;
+                            if (t.copy_ns) {
+                                tm.Record(PushStage::kRxCopy, t.copy_ns);
+                                R.copy.Add(t.copy_ns);
+                            }
+                            tm.Record(PushStage::kOpen, t.open_ns);
+                            R.open.Add(t.open_ns);
+                            if (t.h2d_ns) {
+                                tm.Record(PushStage::kH2D, t.h2d_ns);
+                                R.h2d.Add(t.h2d_ns);
+                            }
+                            tm.rx_segments.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                            R.segs.fetch_add(1, std::memory_order_relaxed);
+                            R.bytes.fetch_add(
+                                job->segs[i].sealed_len - kOverhead,
+                                std::memory_order_relaxed);
+                        }
                         if (job->remaining.fetch_sub(1) != 1) return;
                         const bool ok = job->ok.load();
                         if (!ok) svc->rejected_.fetch_add(1);
@@ -1186,17 +1389,25 @@ struct SecurePushService::Receiver {
         return kOk;
     }
 
+    struct OpenTiming {
+        uint64_t copy_ns = 0, open_ns = 0, h2d_ns = 0;
+    };
+
     // `sender` is the name authenticated in the commit's sealed body.
     bool OpenSegment(const SegCommit& s, const std::string& sender,
-                     const uint8_t tid[16], uint32_t total) {
+                     const uint8_t tid[16], uint32_t total, OpenTiming* t) {
         const uint8_t* slot = slot_ptr(s.slot);
         const uint8_t* sealed = slot;
         if (svc->opt_.rx_copy) {
             // Read the remotely writable slot exactly once into private
             // memory, so the bytes authenticated are the bytes decrypted.
-            if (t_private.size() < s.sealed_len) t_private.resize(s.sealed_len);
+            // Sized for a whole slot on first use, so it never regrows.
+            const auto t0 = Clock::now();
+            if (t_private.size() < s.sealed_len)
+                t_private.resize(std::max<size_t>(s.sealed_len, slot_bytes));
             memcpy(t_private.data(), slot, s.sealed_len);
             sealed = t_private.data();
+            t->copy_ns = NsSince(t0);
         }
         const std::string aad =
             DataAad(svc->fabric_.local_name, sender, tid, s.index,
@@ -1219,26 +1430,35 @@ struct SecurePushService::Receiver {
                      &HostAeadBackend();
         }
         if (direct) {
+            const auto t0 = Clock::now();
             Error e = SecureContext::Global().opener().Open(
                 {sealed, s.sealed_len}, Purpose::kTransfer,
                 {aad.data(), aad.size()}, out.data(), out.size());
+            t->open_ns = NsSince(t0);
             if (e != Error::kOk)
                 LOG(ERROR) << "secure push: segment " << s.index
                            << " failed to open: " << ToString(e);
             return e == Error::kOk;
         }
         const size_t pt = s.sealed_len - kOverhead;
-        auto* bounce = static_cast<uint8_t*>(ThreadBounce(pt));
+        // Sized for a whole slot on first use, so it never regrows (each
+        // growth frees and re-pins host memory).
+        auto* bounce = static_cast<uint8_t*>(
+            ThreadBounce(std::max(pt, slot_bytes - kOverhead)));
         if (!bounce) return false;
         MutableSpan b{bounce, pt};
+        auto t0 = Clock::now();
         Error e = SecureContext::Global().opener().Open(
             {sealed, s.sealed_len}, Purpose::kTransfer, {aad.data(), aad.size()},
             &b, 1);
+        t->open_ns = NsSince(t0);
         if (e != Error::kOk) {
             LOG(ERROR) << "secure push: segment " << s.index
                        << " failed to open: " << ToString(e);
             return false;
         }
+        // Scatter: host pieces copied here, device pieces on the copy engine.
+        t0 = Clock::now();
         size_t off = 0, di = 0;
         std::vector<DevCopy> copies;
         for (size_t i = 0; i < s.dst.size(); ++i) {
@@ -1252,6 +1472,7 @@ struct SecurePushService::Receiver {
             off += out[i].size;
         }
         const bool ok = CopyDevice(copies);
+        t->h2d_ns = NsSince(t0);
         OPENSSL_cleanse(bounce, pt);
         return ok;
     }
@@ -1303,7 +1524,9 @@ struct SecurePushService::Peer {
 // ---------------------------------------------------------------- service --
 
 SecurePushService::SecurePushService(PushFabric fabric, PushOptions options)
-    : fabric_(std::move(fabric)), opt_(std::move(options)) {}
+    : fabric_(std::move(fabric)),
+      opt_(std::move(options)),
+      tm_(std::make_unique<Telemetry>()) {}
 
 SecurePushService::~SecurePushService() {
     WithdrawP2dEndpoint(fabric_.local_name);
@@ -1334,6 +1557,46 @@ bool SecurePushService::receiver_enabled() const {
     return rx_ != nullptr;
 }
 
+PushStats SecurePushService::push_stats() const {
+    PushStats p = tm_->Snapshot();
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+    p.numa_node = numa_node_;
+    return p;
+}
+
+void SecurePushService::ResolvePlacementLocked(const void* near) {
+    if (placed_) return;
+    placed_ = true;
+    int node = -1;
+    if (opt_.numa_node >= 0)
+        node = opt_.numa_node;
+    else if (opt_.numa_node == PushOptions::kNumaAuto)
+        node = HomeNumaNode(near);
+    numa_node_ = node;
+    std::vector<int> node_cpus = NumaNodeCpus(node);
+    if (!opt_.cpus.empty()) {
+        crypto_cpus_ = opt_.cpus;
+        crypto_cpus_each_ = true;
+    } else {
+        // The whole node, so the scheduler balances crypto threads over its
+        // cores; another rank's threads stay on their own node.
+        crypto_cpus_ = node_cpus;
+        crypto_cpus_each_ = false;
+    }
+    std::string cpus;
+    if (!crypto_cpus_.empty())
+        cpus = std::to_string(crypto_cpus_.front()) + ".." +
+               std::to_string(crypto_cpus_.back()) + " (" +
+               std::to_string(crypto_cpus_.size()) + ")";
+    LOG(INFO) << "secure push: staging on NUMA node " << node
+              << (opt_.numa_node == PushOptions::kNumaAuto
+                      ? " (auto)"
+                      : opt_.numa_node == PushOptions::kNumaNone ? " (none)"
+                                                                 : "")
+              << ", crypto threads on CPUs "
+              << (cpus.empty() ? std::string("any") : cpus);
+}
+
 ControlStats SecurePushService::control_stats() const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
     return rx_ ? rx_->Stats() : ControlStats{};
@@ -1354,9 +1617,10 @@ int SecurePushService::control_port() const {
     return rx_ ? rx_->port : 0;
 }
 
-int SecurePushService::EnableReceiver() {
+int SecurePushService::EnableReceiver(const void* near) {
     std::lock_guard<std::mutex> lock(mu_);
     if (rx_) return 0;
+    ResolvePlacementLocked(near);
     auto rx = std::make_unique<Receiver>();
     rx->svc = this;
     rx->slot_bytes = (SealedSize(opt_.segment_bytes) + 4095) & ~size_t(4095);
@@ -1406,9 +1670,11 @@ int SecurePushService::EnableReceiver() {
 
     // Receive staging: slots only. Peers can write any of it; it only ever
     // holds sealed bytes, and nothing about discovery lives in it.
-    void* base = mmap(nullptr, rx->bytes, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (base == MAP_FAILED) {
+    // On the staging node, so the NIC the engine picks for it is that
+    // node's (the one the GPU's own transfers use) and the copy-out reads
+    // local memory.
+    void* base = MapOnNode(rx->bytes, numa_node_, NumaNodeCpus(numa_node_));
+    if (!base) {
         PLOG(ERROR) << "secure push: cannot map " << rx->bytes
                     << " bytes of receive staging";
         return -1;
@@ -1419,34 +1685,38 @@ int SecurePushService::EnableReceiver() {
     // fetch; connections wait in the listen backlog until the accept thread
     // starts.
     AdvertiseP2dEndpoint(fabric_.local_name, rx->host, rx->port);
-    if (fabric_.register_ciphertext(base, rx->bytes) != 0) {
+    if (fabric_.register_ciphertext(base, rx->bytes, numa_node_) != 0) {
         WithdrawP2dEndpoint(fabric_.local_name);
         LOG(ERROR) << "secure push: cannot register receive staging";
         munmap(base, rx->bytes);
         rx->base = nullptr;
         return -1;
     }
-    rx->open_pool =
-        std::make_unique<CryptoPool>(opt_.threads, opt_.cpus, "mc-p2d-open");
+    rx->open_pool = std::make_unique<CryptoPool>(
+        opt_.threads, crypto_cpus_, "mc-p2d-open", crypto_cpus_each_);
     Receiver* raw = rx.get();
     rx->accept_thread = std::thread([raw] { raw->AcceptLoop(); });
     LOG(INFO) << "secure push: receiver " << fabric_.local_name << " up, control " << rx->host << ":"
               << rx->port << ", " << rx->nslots << " slots of "
-              << rx->slot_bytes << " bytes";
+              << rx->slot_bytes << " bytes on NUMA node " << NodeOfPage(base);
     rx_ = std::move(rx);
     return 0;
 }
 
-bool SecurePushService::EnsureSender() {
+bool SecurePushService::EnsureSender(const void* near) {
     std::lock_guard<std::mutex> lock(mu_);
     if (seal_pool_) return true;
+    ResolvePlacementLocked(near);
     const size_t region = std::min<size_t>(opt_.tx_bytes, 256ull << 20);
     tx_pool_ = std::make_unique<StagingPool>(
         region, opt_.tx_bytes,
-        [this](void* p, size_t n) { return fabric_.register_ciphertext(p, n); },
+        [this, node = numa_node_](void* p, size_t n) {
+            return fabric_.register_ciphertext(p, n, node);
+        },
         [this](void* p) { return fabric_.unregister(p); });
-    seal_pool_ =
-        std::make_unique<CryptoPool>(opt_.threads, opt_.cpus, "mc-p2d-seal");
+    tx_pool_->set_numa_node(numa_node_, NumaNodeCpus(numa_node_));
+    seal_pool_ = std::make_unique<CryptoPool>(
+        opt_.threads, crypto_cpus_, "mc-p2d-seal", crypto_cpus_each_);
     return true;
 }
 
@@ -1553,10 +1823,16 @@ struct SecurePushService::Job {
 
 namespace {
 
-// Seals one segment into `out` (send staging).
+struct SealTiming {
+    uint64_t d2h_ns = 0, seal_ns = 0;
+};
+
+// Seals one segment into `out` (send staging). A device source bounces
+// through this thread's pinned buffer, sized at least `bounce_min` so it is
+// allocated once rather than regrown as segment sizes ramp up.
 bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
                  size_t out_size, size_t* sealed_len, SealedInfo* info,
-                 Algorithm alg) {
+                 Algorithm alg, size_t bounce_min, SealTiming* t) {
     std::vector<ConstSpan> in = seg.src;
     std::vector<std::pair<size_t, int>> dev;
     for (size_t i = 0; i < in.size(); ++i) {
@@ -1569,8 +1845,10 @@ bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
             &HostAeadBackend()) {
             // Path B: device -> pinned host with the copy engine, seal on the
             // CPU. A device backend, when registered, seals in place instead.
-            auto* bounce = static_cast<uint8_t*>(ThreadBounce(seg.bytes));
+            auto* bounce = static_cast<uint8_t*>(
+                ThreadBounce(std::max(seg.bytes, bounce_min)));
             if (!bounce) return false;
+            const auto t0 = Clock::now();
             size_t off = 0, di = 0;
             std::vector<DevCopy> copies;
             for (size_t i = 0; i < in.size(); ++i) {
@@ -1583,11 +1861,14 @@ bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
                 off += in[i].size;
             }
             if (!CopyDevice(copies)) return false;
+            t->d2h_ns = NsSince(t0);
         }
     }
     auto& sealer = SecureContext::Global().sealer(Purpose::kTransfer);
+    const auto t1 = Clock::now();
     Error e = sealer.Seal(in.data(), in.size(), {aad.data(), aad.size()},
                           {out, out_size}, sealed_len);
+    t->seal_ns = NsSince(t1);
     if (!dev.empty()) CleanseThreadBounce(seg.bytes);
     if (e != Error::kOk) {
         LOG(ERROR) << "secure push: seal failed: " << ToString(e);
@@ -1618,7 +1899,16 @@ bool SecurePushService::PushAsync(Transport::SegmentID target,
         job->pieces.push_back(p);
     }
     std::thread([this, job, done = std::move(done)] {
+        const auto t0 = Clock::now();
         bool ok = RunJob(*job);
+        if (ok && job->total) {
+            tm_->Record(PushStage::kPush, NsSince(t0));
+            tm_->pushes.fetch_add(1, std::memory_order_relaxed);
+            tm_->bytes.fetch_add(job->total, std::memory_order_relaxed);
+        } else if (!ok) {
+            tm_->failed.fetch_add(1, std::memory_order_relaxed);
+        }
+        MaybeLogStats();
         done(ok);
         std::lock_guard<std::mutex> lock(jobs_mu_);
         if (--active_jobs_ == 0) jobs_cv_.notify_all();
@@ -1672,6 +1962,7 @@ struct SecurePushService::Stream {
         bool posted = false, waited = false;
         void* handle = nullptr;
         uint64_t remote = 0;
+        Clock::time_point posted_at{}, commit_sent_at{};
     };
     std::mutex mu;
     std::condition_variable cv;
@@ -1683,6 +1974,9 @@ struct SecurePushService::Stream {
     std::vector<uint32_t> slots;
     uint64_t rx_base = 0, slot_bytes = 0;
     uint32_t acked = 0;
+    // This push's stages (per-segment sums/maxima; the waits are the
+    // committer's), also recorded in the service's cumulative telemetry.
+    SumMax d2h, seal, write, rtt, wait_seal, wait_write, wait_ack;
 
     ~Stream() { Drain(); }
 
@@ -1715,8 +2009,17 @@ struct SecurePushService::Stream {
             Seg& mine = segs[i];
             SealedInfo info;
             size_t len = 0;
-            const bool ok =
-                SealSegment(mine.seg, mine.aad, out, stride, &len, &info, alg);
+            SealTiming t;
+            const bool ok = SealSegment(mine.seg, mine.aad, out, stride, &len,
+                                        &info, alg, seg_bytes, &t);
+            if (ok) {
+                if (t.d2h_ns) {
+                    svc->tm_->Record(PushStage::kD2H, t.d2h_ns);
+                    d2h.Add(t.d2h_ns);
+                }
+                svc->tm_->Record(PushStage::kSeal, t.seal_ns);
+                seal.Add(t.seal_ns);
+            }
             if (ok && svc->hooks_.on_segment_sealed)
                 svc->hooks_.on_segment_sealed(info);
             std::lock_guard<std::mutex> lock(mu);
@@ -1742,6 +2045,7 @@ struct SecurePushService::Stream {
         req.target_offset = rx_base + uint64_t(slots[i % g]) * slot_bytes;
         req.length = sg.sealed_len;
         sg.remote = req.target_offset;
+        sg.posted_at = Clock::now();
         sg.handle = svc->fabric_.begin_ops({req});
         sg.posted = true;
     }
@@ -1772,9 +2076,28 @@ struct SecurePushService::Stream {
     }
 };
 
+void SecurePushService::MaybeLogStats() {
+    if (opt_.stats_interval_s <= 0) return;
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            Clock::now().time_since_epoch())
+                            .count();
+    int64_t last = tm_->last_summary_s.load(std::memory_order_relaxed);
+    if (last == 0) {
+        // The first push starts the interval.
+        tm_->last_summary_s.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < opt_.stats_interval_s ||
+        !tm_->last_summary_s.compare_exchange_strong(last, now))
+        return;
+    LOG(INFO) << "secure push: stage timings since start: "
+              << push_stats().ToString();
+}
+
 bool SecurePushService::RunJob(Job& job) {
     if (job.total == 0) return true;
-    if (!EnsureSender()) return false;
+    if (!EnsureSender(job.pieces.front().src)) return false;
+    const auto t_start = Clock::now();
     RAND_bytes(job.tid, sizeof(job.tid));
     const auto deadline_ms = opt_.timeout_ms;
     std::shared_ptr<Peer> peer;
@@ -1959,6 +2282,11 @@ bool SecurePushService::RunJob(Job& job) {
             LOG(ERROR) << "secure push: malformed commit reply";
             return false;
         }
+        {
+            const uint64_t ns = NsSince(st->segs[win].commit_sent_at);
+            tm_->Record(PushStage::kCommitRtt, ns);
+            st->rtt.Add(ns);
+        }
         if (status != kOk) {
             LOG(ERROR) << "secure push: " << peer->name << " refused segment "
                        << win << " (status " << status << ")";
@@ -1989,8 +2317,18 @@ bool SecurePushService::RunJob(Job& job) {
             const uint64_t remote = sg.remote;
             const size_t len = sg.sealed_len;
             const uint32_t slot = st->slots[c % g];
+            const auto posted_at = sg.posted_at;
             lk.unlock();
+            const auto tw = Clock::now();
             Status s = fabric_.wait_ops(h, deadline_ms);
+            {
+                const uint64_t waited = NsSince(tw);
+                const uint64_t lat = NsSince(posted_at);
+                tm_->Record(PushStage::kWriteWait, waited);
+                tm_->Record(PushStage::kWrite, lat);
+                st->wait_write.Add(waited);
+                st->write.Add(lat);
+            }
             if (!s.ok()) {
                 LOG(ERROR) << "secure push: fabric write to " << peer->name
                            << " failed: " << s.ToString();
@@ -2016,6 +2354,7 @@ bool SecurePushService::RunJob(Job& job) {
                 cw.U64(d.dst);
                 cw.U64(d.len);
             }
+            st->segs[c].commit_sent_at = Clock::now();
             if (!send(cw.str())) {
                 ok = false;
                 break;
@@ -2031,16 +2370,37 @@ bool SecurePushService::RunJob(Job& job) {
         if (c > st->acked && (c == n || st->segs[c].state == 1)) {
             // Nothing to commit until a slot frees up (or all committed).
             lk.unlock();
+            const auto ta = Clock::now();
             ok = read_ack();
+            const uint64_t waited = NsSince(ta);
+            tm_->Record(PushStage::kAckWait, waited);
+            st->wait_ack.Add(waited);
             continue;
         }
         // Wait for segment c's seal.
+        const auto ts = Clock::now();
         if (!st->cv.wait_for(lk, std::chrono::milliseconds(deadline_ms),
                              [&] { return st->segs[c].state != 0; })) {
             LOG(ERROR) << "secure push: sealing segment " << c
                        << " timed out";
             ok = false;
         }
+        const uint64_t waited = NsSince(ts);
+        tm_->Record(PushStage::kSealWait, waited);
+        st->wait_seal.Add(waited);
+    }
+    if (ok && VLOG_IS_ON(1)) {
+        const uint64_t ns = NsSince(t_start);
+        VLOG(1) << "secure push: " << job.total << " B in " << n
+                << " segments to " << peer->name << " in " << Ms(ns)
+                << " ms (" << (ns ? job.total / static_cast<double>(ns) : 0)
+                << " GB/s), node " << numa_node_
+                << "; per segment sum/max ms: d2h " << Ms(st->d2h)
+                << ", seal " << Ms(st->seal) << ", write " << Ms(st->write)
+                << ", commit_rtt " << Ms(st->rtt)
+                << "; committer waited sum/max ms: seal "
+                << Ms(st->wait_seal) << ", write " << Ms(st->wait_write)
+                << ", ack " << Ms(st->wait_ack);
     }
     st.reset();  // waits for anything still in flight
     if (!ok) {

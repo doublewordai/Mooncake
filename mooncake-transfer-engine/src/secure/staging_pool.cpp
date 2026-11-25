@@ -15,9 +15,15 @@
 #include "secure/staging_pool.h"
 
 #include <glog/logging.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <thread>
 
 namespace mooncake {
 namespace secure {
@@ -25,7 +31,73 @@ namespace secure {
 namespace {
 constexpr size_t kAlign = 64;
 size_t AlignUp(size_t n, size_t a) { return (n + a - 1) / a * a; }
+
+// Linux mempolicy constants (numaif.h, without linking libnuma).
+constexpr int kMpolPreferred = 1;
+constexpr unsigned kMpolMfMove = 1u << 1;
+constexpr unsigned long kMpolFNode = 1ul << 0;
+constexpr unsigned long kMpolFAddr = 1ul << 1;
+constexpr int kMaxNodes = 256;
+
+void Populate(void* p, size_t n) {
+#ifdef MADV_POPULATE_WRITE
+    if (madvise(p, n, MADV_POPULATE_WRITE) == 0) return;
+#endif
+    const long page = sysconf(_SC_PAGESIZE);
+    auto* c = static_cast<volatile char*>(p);
+    for (size_t off = 0; off < n; off += static_cast<size_t>(page)) c[off] = 0;
+}
 }  // namespace
+
+void* MapOnNode(size_t n, int node, const std::vector<int>& cpus) {
+    if (node < 0 || node >= kMaxNodes) {
+        void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        return p == MAP_FAILED ? nullptr : p;
+    }
+    void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    unsigned long mask[kMaxNodes / (8 * sizeof(unsigned long))] = {};
+    mask[node / (8 * sizeof(unsigned long))] |=
+        1ul << (node % (8 * sizeof(unsigned long)));
+    const long rc = syscall(SYS_mbind, p, n, kMpolPreferred, mask,
+                            static_cast<unsigned long>(kMaxNodes + 1),
+                            kMpolMfMove);
+    if (rc != 0)
+        VLOG(1) << "secure staging: mbind to node " << node
+                << " refused (errno " << errno
+                << "); placing by first touch";
+    if (cpus.empty()) {
+        Populate(p, n);
+        return p;
+    }
+    // First touch from the node's own CPUs, without moving the caller.
+    std::thread t([&] {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int c : cpus)
+            if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        Populate(p, n);
+    });
+    t.join();
+    return p;
+}
+
+int NodeOfPage(const void* p) {
+    int node = -1;
+    if (syscall(SYS_get_mempolicy, &node, nullptr, 0ul, const_cast<void*>(p),
+                kMpolFNode | kMpolFAddr) != 0)
+        return -1;
+    return node;
+}
+
+void StagingPool::set_numa_node(int node, std::vector<int> cpus) {
+    std::lock_guard<std::mutex> lock(mu_);
+    node_ = node;
+    node_cpus_ = std::move(cpus);
+}
 
 StagingBuffer::~StagingBuffer() { Release(); }
 
@@ -74,9 +146,8 @@ bool StagingPool::AddRegionLocked(size_t min_bytes) {
     size_t mapped = 0;
     for (auto& r : regions_) mapped += r->size;
     if (mapped + size > max_bytes_) return false;
-    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (p == MAP_FAILED) {
+    void* p = MapOnNode(size, node_, node_cpus_);
+    if (!p) {
         PLOG(ERROR) << "secure staging: mmap of " << size << " bytes failed";
         return false;
     }
@@ -92,7 +163,8 @@ bool StagingPool::AddRegionLocked(size_t min_bytes) {
     r->free[0] = size;
     regions_.push_back(std::move(r));
     LOG(INFO) << "secure staging: added a " << size << "-byte region ("
-              << regions_.size() << " regions)";
+              << regions_.size() << " regions) on NUMA node " << NodeOfPage(p)
+              << " (wanted " << node_ << ")";
     return true;
 }
 

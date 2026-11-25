@@ -53,8 +53,16 @@ int SecureTransport::install(std::string& local_server_name,
     rc = inner_->install(local_server_name, meta, topo);
     if (rc) return rc;
     PushFabric f;
-    f.register_ciphertext = [this](void* p, size_t n) {
+    f.register_ciphertext = [this](void* p, size_t n, int node) {
         CiphertextRegistrationScope scope;
+        // Named by node, the engine registers it on that node's NIC (the
+        // one it uses for the GPU on that node) even if some pages landed
+        // elsewhere; a node it has no NIC entry for falls back to where the
+        // memory is.
+        if (node >= 0 &&
+            registerLocalMemory(p, n, "cpu:" + std::to_string(node), true,
+                                true) == 0)
+            return 0;
         return registerLocalMemory(p, n, kWildcardLocation, true, true);
     };
     f.unregister = [this](void* p) { return unregisterLocalMemory(p, true); };
@@ -378,7 +386,7 @@ int SecureTransport::registerLocalMemory(void* addr, size_t length,
         std::unique_lock<std::shared_mutex> lock(mu_);
         regions_[reinterpret_cast<uintptr_t>(addr)] = Region{length, nic};
     }
-    if (!nic && EnableReceiver() != 0) {
+    if (!nic && EnableReceiver(addr) != 0) {
         std::unique_lock<std::shared_mutex> lock(mu_);
         regions_.erase(reinterpret_cast<uintptr_t>(addr));
         return -1;
@@ -388,9 +396,9 @@ int SecureTransport::registerLocalMemory(void* addr, size_t length,
 
 // Local-only memory can be a push destination, so the first registration of
 // it brings up the receive side (staging, control server).
-int SecureTransport::EnableReceiver() {
+int SecureTransport::EnableReceiver(const void* near) {
     if (!push_) return 0;
-    if (push_->EnableReceiver() == 0) return 0;
+    if (push_->EnableReceiver(near) == 0) return 0;
     LOG(ERROR) << "secure mode: cannot start the secure push receiver; "
                   "refusing to register local-only memory";
     return -1;
@@ -421,7 +429,8 @@ int SecureTransport::registerLocalMemoryBatch(
             regions_[reinterpret_cast<uintptr_t>(b.addr)] =
                 Region{b.length, nic};
     }
-    if (!nic && !buffer_list.empty() && EnableReceiver() != 0) {
+    if (!nic && !buffer_list.empty() &&
+        EnableReceiver(buffer_list.front().addr) != 0) {
         std::unique_lock<std::shared_mutex> lock(mu_);
         for (const auto& b : buffer_list)
             regions_.erase(reinterpret_cast<uintptr_t>(b.addr));

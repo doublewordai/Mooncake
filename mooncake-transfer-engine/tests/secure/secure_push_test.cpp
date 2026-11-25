@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -31,9 +32,11 @@
 
 #include "control_auth.h"
 #include "handshake_auth.h"
+#include "secure/device_copy.h"
 #include "secure/kv_crypto.h"
 #include "secure/secure_push.h"
 #include "secure/secure_transport.h"
+#include "secure/staging_pool.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -597,6 +600,52 @@ TEST_F(SecurePushTest, LargeWindowedTransfer) {
     ExpectDelivered(pieces);
 }
 
+// Stage telemetry accounts for every segment of a push on both sides (the
+// numbers the DW-1288 contention diagnosis reads), and each histogram holds
+// exactly its stage's samples.
+TEST_F(SecurePushTest, StageTimingsCoverEverySegment) {
+    auto* tx = A().xport->push_service();
+    auto* rx = B().xport->push_service();
+    const PushStats tx0 = tx->push_stats(), rx0 = rx->push_stats();
+    constexpr size_t n = 3 << 20;
+    Buf src(A(), n, 0);
+    Buf dst(B(), n, 0);
+    auto data = Random(n, 31);
+    memcpy(src.data(), data.data(), n);
+    std::atomic<uint64_t> segments{0};
+    tx->test_hooks().on_segment_sealed = [&](const SealedInfo&) {
+        ++segments;
+    };
+    auto seg = Open(A(), B());
+    ASSERT_EQ(Transfer(A(), seg, {{src.data(), dst.data(), n}}),
+              Transport::TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(memcmp(src.data(), dst.data(), n), 0);
+    const PushStats tx1 = tx->push_stats(), rx1 = rx->push_stats();
+    auto delta = [](const PushStats& a, const PushStats& b, PushStage s) {
+        return b.stage[static_cast<int>(s)].count -
+               a.stage[static_cast<int>(s)].count;
+    };
+    const uint64_t k = segments.load();
+    ASSERT_GT(k, 1u);
+    EXPECT_EQ(tx1.pushes - tx0.pushes, 1u);
+    EXPECT_EQ(tx1.bytes - tx0.bytes, n);
+    EXPECT_EQ(delta(tx0, tx1, PushStage::kPush), 1u);
+    for (PushStage s :
+         {PushStage::kSeal, PushStage::kWrite, PushStage::kCommitRtt})
+        EXPECT_EQ(delta(tx0, tx1, s), k) << PushStageName(s);
+    EXPECT_EQ(rx1.rx_segments - rx0.rx_segments, k);
+    EXPECT_EQ(delta(rx0, rx1, PushStage::kOpen), k);
+    EXPECT_EQ(delta(rx0, rx1, PushStage::kRxCopy), k);  // RX_COPY default on
+    for (const PushStats* p : {&tx1, &rx1})
+        for (const StageStats& st : p->stage) {
+            uint64_t in_buckets = 0;
+            for (uint64_t b : st.buckets) in_buckets += b;
+            EXPECT_EQ(in_buckets, st.count);
+            EXPECT_LE(st.max_ns, st.sum_ns);
+        }
+    EXPECT_NE(tx1.ToString().find("seal{n="), std::string::npos);
+}
+
 TEST_F(SecurePushTest, RetryUsesFreshNoncesAndTransferId) {
     Buf src(A(), 1 << 18, 0x66);
     Buf dst(B(), 1 << 18, 0);
@@ -877,7 +926,7 @@ TEST_F(SecurePushTest, UnauthenticatedAndIdleConnectionsAreClosed) {
     o.handshake_timeout_ms = 300;
     o.idle_timeout_ms = 1500;
     PushFabric f;
-    f.register_ciphertext = [](void*, size_t) { return 0; };
+    f.register_ciphertext = [](void*, size_t, int) { return 0; };
     f.unregister = [](void*) { return 0; };
     f.is_local_only = [](const void*, size_t) { return false; };
     f.local_name = "127.0.0.1:1";
@@ -968,6 +1017,42 @@ TEST(SecurePushOptions, SegmentPlan) {
         EXPECT_EQ(plan.back().second, 7u);
     }
     EXPECT_TRUE(PlanPushSegments(0, seg, first, 8).empty());
+}
+
+// Staging asked for on a node lands there, on every node this process may
+// run on, wherever the calling thread runs.
+TEST(SecurePushPlacement, StagingLandsOnTheRequestedNode) {
+    constexpr size_t n = 8 << 20;
+    int checked = 0;
+    for (int want = 0; want < 64; ++want) {
+        const auto cpus = NumaNodeCpus(want);
+        if (cpus.empty()) continue;
+        void* p = MapOnNode(n, want, cpus);
+        ASSERT_NE(p, nullptr);
+        const int first = NodeOfPage(p);
+        const int last = NodeOfPage(static_cast<char*>(p) + n - 1);
+        munmap(p, n);
+        if (first < 0) GTEST_SKIP() << "get_mempolicy unavailable here";
+        EXPECT_EQ(first, want);
+        EXPECT_EQ(last, want);
+        ++checked;
+    }
+    EXPECT_GT(checked, 0);
+}
+
+// A malformed MC_SECURE_P2D_NUMA_NODE is refused (auto), not read as a node.
+TEST(SecurePushOptions, NumaNode) {
+    auto parse = [](const char* v) {
+        setenv("MC_SECURE_P2D_NUMA_NODE", v, 1);
+        const int node = PushOptions::FromEnv().numa_node;
+        unsetenv("MC_SECURE_P2D_NUMA_NODE");
+        return node;
+    };
+    EXPECT_EQ(parse("auto"), PushOptions::kNumaAuto);
+    EXPECT_EQ(parse("none"), PushOptions::kNumaNone);
+    EXPECT_EQ(parse("3"), 3);
+    for (const char* bad : {"x", "-1", "3x", "999"})
+        EXPECT_EQ(parse(bad), PushOptions::kNumaAuto) << bad;
 }
 
 TEST(SecurePushOptions, CpuList) {

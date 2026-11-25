@@ -103,8 +103,20 @@ namespace secure {
 //   MC_SECURE_P2D_RX_BYTES         receive staging (256 MiB)
 //   MC_SECURE_P2D_TX_BYTES         cap on send staging (1 GiB)
 //   MC_SECURE_P2D_CPUS             CPU list the crypto threads are pinned
-//                                  to, e.g. "72-79" (GPU-local NUMA node);
-//                                  unset: not pinned
+//                                  to, one CPU each, e.g. "72-79"; unset:
+//                                  the staging node's CPUs (see below), or
+//                                  not pinned if there is no staging node
+//   MC_SECURE_P2D_NUMA_NODE        NUMA node for send and receive staging
+//                                  and the crypto threads: "auto" (default:
+//                                  the node of the memory being pushed or
+//                                  received into, for GPU memory the node
+//                                  its GPU hangs off), a node number, or
+//                                  "none" (wherever first touch lands).
+//                                  Staging is ciphertext memory, so its node
+//                                  also picks the NIC it goes out on.
+//   MC_SECURE_P2D_STATS_INTERVAL_S  at most this often, a push logs the
+//                                  cumulative stage timings (60; 0: never).
+//                                  Each push's own breakdown is at VLOG(1).
 //   MC_SECURE_P2D_HOST             address peers use for the control
 //                                  endpoint (default: host part of the
 //                                  engine's segment name)
@@ -130,6 +142,10 @@ struct PushOptions {
     size_t rx_bytes = 256ull << 20;
     size_t tx_bytes = 1ull << 30;
     std::vector<int> cpus;
+    static constexpr int kNumaAuto = -1;
+    static constexpr int kNumaNone = -2;
+    int numa_node = kNumaAuto;
+    int stats_interval_s = 60;
     std::string host;
     int port = 0;
     int timeout_ms = 30000;
@@ -174,11 +190,58 @@ std::vector<std::pair<size_t, size_t>> PlanPushSegments(size_t total,
 // Parses "0-3,8,10-11". Returns false on malformed input.
 bool ParseCpuList(const std::string& text, std::vector<int>* out);
 
-// Fixed-size worker pool; threads optionally pinned to a CPU list.
+// Where the time of secure pushes goes, stage by stage (DW-1288). Sender
+// stages are per segment unless noted; the three waits are the committer's
+// (the thread that posts writes and commits in order) and so show which
+// stage the pipeline is waiting on.
+enum class PushStage : int {
+    kD2H = 0,    // sender: device -> pinned host copy of a segment
+    kSeal,       // sender: sealing a segment into send staging
+    kWrite,      // sender: fabric WRITE, posted -> completion observed
+    kCommitRtt,  // sender: COMMIT sent -> its ACK read
+    kSealWait,   // sender committer: waiting for the next seal
+    kWriteWait,  // sender committer: waiting for a write to complete
+    kAckWait,    // sender committer: waiting for an ACK (no free slot)
+    kPush,       // sender: a whole push, start -> last ACK (per push)
+    kRxCopy,     // receiver: copying a sealed segment out of its slot
+    kOpen,       // receiver: verifying and decrypting a segment
+    kH2D,        // receiver: pinned host -> device copy of a segment
+    kCount
+};
+const char* PushStageName(PushStage s);
+
+// Bucket b of a stage histogram counts durations in [2^(b-1), 2^b)
+// microseconds (bucket 0: under 1 us; the last: everything longer).
+constexpr int kStageBuckets = 24;
+
+struct StageStats {
+    uint64_t count = 0;
+    uint64_t sum_ns = 0;
+    uint64_t max_ns = 0;
+    uint64_t buckets[kStageBuckets] = {};
+    // Upper bound (us) of the bucket holding quantile q (0..1); 0 if empty.
+    uint64_t QuantileUpperUs(double q) const;
+};
+
+// Cumulative since the service started.
+struct PushStats {
+    StageStats stage[static_cast<int>(PushStage::kCount)];
+    uint64_t pushes = 0;         // completed
+    uint64_t failed_pushes = 0;
+    uint64_t bytes = 0;          // plaintext bytes of completed pushes
+    uint64_t rx_segments = 0;    // segments opened (receiver)
+    int numa_node = -1;          // staging node in use (-1: none)
+    // One line: per stage count, mean, max and p50/p99 bucket bounds.
+    std::string ToString() const;
+};
+
+// Fixed-size worker pool; threads optionally pinned to a CPU list: with
+// `each`, thread i to cpus[i % size]; otherwise every thread to the whole
+// list.
 class CryptoPool {
    public:
     CryptoPool(size_t threads, const std::vector<int>& cpus,
-               const char* name);
+               const char* name, bool each = true);
     ~CryptoPool();
     void Run(std::function<void()> fn);
 
@@ -190,14 +253,17 @@ class CryptoPool {
     bool stop_ = false;
     std::vector<std::thread> threads_;
     std::vector<int> cpus_;
+    bool each_ = true;
 };
 
 // What the service needs from the transport it lives in. Kept as callbacks so
 // the service never reaches into transport internals.
 struct PushFabric {
     using Request = Transport::TransferRequest;
-    // Registers [p, p+n) with the NIC as ciphertext memory. 0 on success.
-    std::function<int(void* p, size_t n)> register_ciphertext;
+    // Registers [p, p+n) with the NIC as ciphertext memory, through the NIC
+    // of NUMA node `node` (node < 0: the node the memory is on). 0 on
+    // success.
+    std::function<int(void* p, size_t n, int node)> register_ciphertext;
     std::function<int(void* p)> unregister;
     // True if [p, p+n) lies inside one local-only (not NIC) registered region.
     std::function<bool(const void* p, size_t n)> is_local_only;
@@ -241,9 +307,10 @@ class SecurePushService {
     SecurePushService& operator=(const SecurePushService&) = delete;
 
     // Brings up the receive side (staging, control server) and advertises
-    // the control endpoint in this engine's handshake descriptor.
-    // Idempotent; 0 on success.
-    int EnableReceiver();
+    // the control endpoint in this engine's handshake descriptor. `near`
+    // (optional) is memory pushes will land in; it picks the staging node
+    // (MC_SECURE_P2D_NUMA_NODE=auto). Idempotent; 0 on success.
+    int EnableReceiver(const void* near = nullptr);
     bool receiver_enabled() const;
 
     // Pushes `pieces` to `target` in the background and calls done(true)
@@ -266,6 +333,8 @@ class SecurePushService {
                                               int timeout_ms);
     // Rx statistics for tests.
     uint64_t rejected_requests() const { return rejected_.load(); }
+    // Stage timings (both halves), cumulative.
+    PushStats push_stats() const;
     ControlStats control_stats() const;
     // Forgets every discovered peer and pooled connection, so the next push
     // discovers and connects as a new sender would.
@@ -275,13 +344,20 @@ class SecurePushService {
     struct Receiver;
     struct Job;
     struct Stream;
+    struct Telemetry;
 
    private:
     friend struct Job;
     friend struct Stream;
     std::shared_ptr<Peer> Discover(Transport::SegmentID target, bool force);
     bool RunJob(Job& job);
-    bool EnsureSender();
+    bool EnsureSender(const void* near);
+    // Logs the cumulative stage timings if MC_SECURE_P2D_STATS_INTERVAL_S
+    // passed since the last time.
+    void MaybeLogStats();
+    // mu_ held. Resolves the staging node (once) from `near` and the
+    // options; sets numa_node_ and crypto_cpus_.
+    void ResolvePlacementLocked(const void* near);
 
     PushFabric fabric_;
     PushOptions opt_;
@@ -292,6 +368,11 @@ class SecurePushService {
     std::unique_ptr<StagingPool> tx_pool_;
     std::unique_ptr<CryptoPool> seal_pool_;
     std::map<Transport::SegmentID, std::shared_ptr<Peer>> peers_;
+    bool placed_ = false;
+    int numa_node_ = -1;
+    std::vector<int> crypto_cpus_;
+    bool crypto_cpus_each_ = true;
+    std::unique_ptr<Telemetry> tm_;
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;

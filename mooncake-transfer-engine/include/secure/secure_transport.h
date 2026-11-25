@@ -112,7 +112,7 @@ class SecureTransport final : public Transport {
     Status SubmitTasks(const std::vector<TransferTask*>& task_list,
                        bool group);
     Status StartPush(const std::vector<TransferTask*>& tasks);
-    int EnableReceiver();
+    int EnableReceiver(const void* near);
     void* BeginInnerOps(const std::vector<TransferRequest>& reqs);
     Status WaitInnerOps(void* handle, int timeout_ms);
 

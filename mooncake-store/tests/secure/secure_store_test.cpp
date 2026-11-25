@@ -174,8 +174,9 @@ class SecureStoreTest : public ::testing::Test {
                   0);
     }
 
-    // Both readers get CHECKSUM_MISMATCH for `key`, and a host buffer is left
-    // zeroed (or, if the object was rejected before opening, untouched).
+    // Both readers get CHECKSUM_MISMATCH for `key`, and a host buffer holds
+    // no plaintext: the length the (tampered) header claims is zeroed, the
+    // rest untouched (all of it untouched if rejected before opening).
     void ExpectRejected(const std::string& key, size_t size,
                         const std::string& why) {
         for (auto* reader : {a_.get(), b_.get()}) {
@@ -183,7 +184,11 @@ class SecureStoreTest : public ::testing::Test {
             EXPECT_EQ(reader->get_into(key, out.data(), out.size()),
                       toInt(ErrorCode::CHECKSUM_MISMATCH))
                 << why;
-            EXPECT_TRUE(AllEqual(out, 0) || AllEqual(out, 'x')) << why;
+            auto rest = std::find_if(out.begin(), out.end(),
+                                     [](char c) { return c != 0; });
+            EXPECT_TRUE(std::all_of(rest, out.end(),
+                                    [](char c) { return c == 'x'; }))
+                << why;
         }
     }
 

@@ -114,6 +114,14 @@ void CleanseThreadBounce(size_t n) {
 
 bool CopyDevice(const std::vector<DevCopy>& copies) {
 #ifdef USE_CUDA
+    if (copies.empty()) return true;
+    // The caller may be an application thread: leave its current device as
+    // it was.
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess) {
+        cudaGetLastError();
+        prev = -1;
+    }
     std::vector<int> used;
     bool ok = true;
     for (const auto& c : copies) {
@@ -135,6 +143,7 @@ bool CopyDevice(const std::vector<DevCopy>& copies) {
     if (!ok)
         LOG(ERROR) << "secure: device copy failed: "
                    << cudaGetErrorString(cudaGetLastError());
+    if (prev >= 0) cudaSetDevice(prev);
     return ok;
 #else
     return copies.empty();

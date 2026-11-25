@@ -65,9 +65,105 @@ static int getCudaDeviceId(void* addr) {
     return -1;
 }
 
+// Builds whose runtime provides non-blocking streams and portable pinned host
+// allocations. MLU and SUPA keep the plain synchronous cudaMemcpy path.
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#define MOONCAKE_TCP_ASYNC_DEVICE_COPY 1
+#endif
+
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+// Process-wide free list of pinned staging blocks. ClientSessions are created
+// per slice, so allocating pinned memory per session would put a
+// cudaHostAlloc (slow, and serializing with the device) on every slice.
+class TcpPinnedStagingPool {
+   public:
+    static TcpPinnedStagingPool& instance() {
+        // Leaked on purpose: blocks must not be freed during static
+        // destruction, after the device runtime may already be gone.
+        static auto* pool = new TcpPinnedStagingPool();
+        return *pool;
+    }
+
+    // Returns nullptr if pinned memory is unavailable; the caller then falls
+    // back to pageable memory.
+    char* acquire(size_t size, size_t* capacity) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = free_.begin(); it != free_.end(); ++it) {
+                if (it->second >= size) {
+                    char* data = it->first;
+                    *capacity = it->second;
+                    free_bytes_ -= it->second;
+                    free_.erase(it);
+                    return data;
+                }
+            }
+        }
+        void* data = nullptr;
+        if (cudaHostAlloc(&data, size, cudaHostAllocPortable) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return nullptr;
+        }
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        recordStagingBufferAllocationForTest();
+#endif
+        *capacity = size;
+        return static_cast<char*>(data);
+    }
+
+    void release(char* data, size_t capacity) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (free_bytes_ + capacity <= kMaxFreeBytes) {
+                free_.emplace_back(data, capacity);
+                free_bytes_ += capacity;
+                return;
+            }
+        }
+        cudaFreeHost(data);
+    }
+
+   private:
+    static constexpr size_t kMaxFreeBytes = 64ull << 20;
+    std::mutex mutex_;
+    std::vector<std::pair<char*, size_t>> free_;
+    size_t free_bytes_ = 0;
+};
+#endif
+
+// Host bounce buffer for device-memory slices. Pinned when the runtime allows
+// it (the copy engine can then DMA directly, without the driver's internal
+// pageable bounce); pageable otherwise.
 class TcpStagingBuffer {
    public:
-    char* ensure(size_t size) {
+    TcpStagingBuffer() = default;
+    TcpStagingBuffer(const TcpStagingBuffer&) = delete;
+    TcpStagingBuffer& operator=(const TcpStagingBuffer&) = delete;
+    ~TcpStagingBuffer() { releasePinned(); }
+
+    // `device` is the CUDA ordinal of the memory being staged; it is made
+    // current before allocating so that no context is created on GPU 0.
+    char* ensure(size_t size, int device) {
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+        if (pinned_) {
+            if (pinned_capacity_ >= size) return pinned_;
+            releasePinned();
+        }
+        if (buffer_.size() < size && cudaSetDevice(device) == cudaSuccess) {
+            // Size for a full slice so a short first slice does not force a
+            // second allocation later.
+            size_t capacity = 0;
+            pinned_ = TcpPinnedStagingPool::instance().acquire(
+                std::max(size, getChunkSize()), &capacity);
+            if (pinned_) {
+                pinned_capacity_ = capacity;
+                return pinned_;
+            }
+        }
+#else
+        (void)device;
+#endif
         if (buffer_.size() < size) {
             buffer_.resize(size);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
@@ -78,25 +174,73 @@ class TcpStagingBuffer {
     }
 
    private:
+    void releasePinned() {
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+        if (pinned_) {
+            TcpPinnedStagingPool::instance().release(pinned_, pinned_capacity_);
+            pinned_ = nullptr;
+            pinned_capacity_ = 0;
+        }
+#endif
+    }
+
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+    char* pinned_ = nullptr;
+    size_t pinned_capacity_ = 0;
+#endif
     std::vector<char> buffer_;
 };
 
-#ifdef USE_MACA
-static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
-    cudaStream_t stream;
-    cudaError_t status =
-        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-    if (status != cudaSuccess) return status;
-
-    status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
-    if (status == cudaSuccess) {
-        status = cudaStreamSynchronize(stream);
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+// One non-blocking copy stream per device per IO thread, destroyed when the
+// thread exits.
+class TcpCopyStreams {
+   public:
+    ~TcpCopyStreams() {
+        for (auto& entry : streams_) cudaStreamDestroy(entry.second);
     }
 
-    cudaError_t destroy_status = cudaStreamDestroy(stream);
-    return status == cudaSuccess ? destroy_status : status;
-}
+    cudaError_t get(int device, cudaStream_t* stream) {
+        auto it = streams_.find(device);
+        if (it != streams_.end()) {
+            *stream = it->second;
+            return cudaSuccess;
+        }
+        cudaError_t status =
+            cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+        if (status == cudaSuccess) streams_.emplace(device, *stream);
+        return status;
+    }
+
+   private:
+    std::unordered_map<int, cudaStream_t> streams_;
+};
 #endif
+
+// Copies one slice between device memory on `device` and a host staging
+// buffer. The copy must not use the legacy default stream: that stream
+// synchronizes with every blocking stream on the device, so each slice would
+// wait for whatever kernels the application (e.g. an inference engine running
+// forward passes) has queued, collapsing transfer throughput while the GPU is
+// busy.
+static cudaError_t copyTcpCudaMemory(int device, void* dst, const void* src,
+                                     size_t size) {
+    // Must precede any other runtime call to avoid implicit GPU 0 context
+    // creation.
+    cudaError_t status = cudaSetDevice(device);
+    if (status != cudaSuccess) return status;
+#ifdef MOONCAKE_TCP_ASYNC_DEVICE_COPY
+    thread_local TcpCopyStreams streams;
+    cudaStream_t stream;
+    status = streams.get(device, &stream);
+    if (status != cudaSuccess) return status;
+    status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(stream);
+    return status;
+#else
+    return cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+#endif
+}
 #endif
 
 // Forward declaration
@@ -251,16 +395,10 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
-            cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
-            cudaError_t cuda_status = copyTcpCudaMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size);
-#else
+            dram_buffer = staging_buffer_.ensure(buffer_size, cuda_device_);
             cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
-#endif
+                copyTcpCudaMemory(cuda_device_, dram_buffer,
+                                  addr + total_transferred_bytes_, buffer_size);
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
@@ -314,7 +452,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
+            dram_buffer = staging_buffer_.ensure(buffer_size, cuda_device_);
         }
 #endif
 
@@ -341,16 +479,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
-                    cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-#endif
+                    cudaError_t cuda_status = copyTcpCudaMemory(
+                        cuda_device_, addr + total_transferred_bytes_,
+                        dram_buffer, transferred_bytes);
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ServerSession::readBody failed to copy to CUDA "
@@ -769,7 +900,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
+            dram_buffer = staging_buffer_.ensure(buffer_size, cuda_device_);
         }
 #endif
 
@@ -806,16 +937,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
-                    cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-#endif
+                    cudaError_t cuda_status = copyTcpCudaMemory(
+                        cuda_device_, addr + total_transferred_bytes_,
+                        dram_buffer, transferred_bytes);
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ClientSession::readBody failed to copy to CUDA "
@@ -870,16 +994,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
-            cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
-            cudaError_t cuda_status = copyTcpCudaMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size);
-#else
+            dram_buffer = staging_buffer_.ensure(buffer_size, cuda_device_);
             cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
-#endif
+                copyTcpCudaMemory(cuda_device_, dram_buffer,
+                                  addr + total_transferred_bytes_, buffer_size);
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "

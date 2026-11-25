@@ -15,10 +15,12 @@ if(USE_CUDA)
   target_link_libraries(mooncake_secure PUBLIC CUDA::cudart)
 endif()
 
-# Control plane: key loading, HMAC tags and the replay cache; shared with the
-# Store. See control_auth.h. The handshake framing hook (handshake_auth.cpp)
-# is added to transfer_engine in ../CMakeLists.txt, after that target exists.
-add_library(mooncake_control_auth STATIC control_auth.cpp)
+# Control plane: HMAC tags and the replay cache, plus the switch and key source
+# both halves read (secure_env.cpp); shared with the Store and the master, which
+# do not link the data path. See control_auth.h and secure_env.h. The
+# handshake framing hook (handshake_auth.cpp) is added to transfer_engine in
+# ../CMakeLists.txt, after that target exists.
+add_library(mooncake_control_auth STATIC control_auth.cpp secure_env.cpp)
 set_target_properties(mooncake_control_auth
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mooncake_control_auth

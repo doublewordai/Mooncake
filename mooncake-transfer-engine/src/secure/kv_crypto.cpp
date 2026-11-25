@@ -14,6 +14,8 @@
 
 #include "secure/kv_crypto.h"
 
+#include "secure_env.h"
+
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -248,56 +250,6 @@ std::vector<std::shared_ptr<AeadBackend>>& Backends() {
     return *v;
 }
 
-std::string Trim(const std::string& s) {
-    size_t b = 0, e = s.size();
-    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
-    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
-    return s.substr(b, e - b);
-}
-
-bool ReadFile(const std::string& path, std::string* out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    *out = ss.str();
-    return true;
-}
-
-// A key file holds either exactly 32 raw bytes, or one encoded key per
-// non-empty line.
-Error ParseKeyFile(const std::string& content,
-                   std::vector<std::array<uint8_t, kKeySize>>* keys) {
-    if (content.size() == kKeySize) {
-        std::array<uint8_t, kKeySize> k;
-        std::memcpy(k.data(), content.data(), kKeySize);
-        keys->push_back(k);
-        return Error::kOk;
-    }
-    std::istringstream lines(content);
-    std::string line;
-    bool any = false;
-    while (std::getline(lines, line)) {
-        line = Trim(line);
-        if (line.empty() || line[0] == '#') continue;
-        std::array<uint8_t, kKeySize> k;
-        Error e = ParseKeyMaterial(line, &k);
-        OPENSSL_cleanse(line.data(), line.size());
-        if (e != Error::kOk) return e;
-        keys->push_back(k);
-        any = true;
-    }
-    return any ? Error::kOk : Error::kNoKey;
-}
-
-bool EnvTrue(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v) return false;
-    std::string s(v);
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s == "1" || s == "true" || s == "on" || s == "yes";
-}
-
 std::string EnvStr(const char* name) {
     const char* v = std::getenv(name);
     return v ? std::string(v) : std::string();
@@ -401,34 +353,10 @@ uint32_t DeriveKeyId(const uint8_t key[kKeySize]) {
 
 Error ParseKeyMaterial(const std::string& text,
                        std::array<uint8_t, kKeySize>* out) {
-    std::string s = Trim(text);
-    if (s.size() == 2 * kKeySize &&
-        std::all_of(s.begin(), s.end(),
-                    [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); })) {
-        for (size_t i = 0; i < kKeySize; ++i) {
-            unsigned v = 0;
-            std::sscanf(s.c_str() + 2 * i, "%2x", &v);
-            (*out)[i] = static_cast<uint8_t>(v);
-        }
-        OPENSSL_cleanse(s.data(), s.size());
-        return Error::kOk;
-    }
-    // base64 of 32 bytes is 44 chars with one '=' of padding.
-    if (s.size() == 44 && s[43] == '=' && s[42] != '=') {
-        uint8_t buf[34];
-        int n = EVP_DecodeBlock(buf, reinterpret_cast<const uint8_t*>(s.data()),
-                                static_cast<int>(s.size()));
-        OPENSSL_cleanse(s.data(), s.size());
-        if (n != 33) {
-            OPENSSL_cleanse(buf, sizeof(buf));
-            return Error::kBadConfig;
-        }
-        std::memcpy(out->data(), buf, kKeySize);
-        OPENSSL_cleanse(buf, sizeof(buf));
-        return Error::kOk;
-    }
-    OPENSSL_cleanse(s.data(), s.size());
-    return Error::kBadConfig;
+    static_assert(kKeySize == secure_env::kKeySize);
+    return secure_env::ParseKeyMaterial(text, out) == secure_env::KeyError::kOk
+               ? Error::kOk
+               : Error::kBadConfig;
 }
 
 std::shared_ptr<const KeyRing> KeyRing::FromKeys(
@@ -455,11 +383,16 @@ const MasterKey* KeyRing::Find(uint32_t key_id) const {
 
 SecureConfig SecureConfig::FromEnv() {
     SecureConfig c;
-    c.enabled = EnvTrue("MC_SECURE_MODE");
-    c.key_file = EnvStr("MC_SECURE_KEY_FILE");
-    c.key_inline = EnvStr("MC_SECURE_KEY");
-    c.previous_key_file = EnvStr("MC_SECURE_PREVIOUS_KEY_FILE");
-    c.previous_key_inline = EnvStr("MC_SECURE_PREVIOUS_KEY");
+    // The switch and key variables are shared with control-plane
+    // authentication; see secure_env.h.
+    const secure_env::Switch sw = secure_env::ReadSwitch();
+    c.enabled = sw.enabled;
+    c.switch_error = sw.error;
+    const secure_env::KeySources src = secure_env::ReadKeySources();
+    c.key_file = src.key_file;
+    c.key_inline = src.key_inline;
+    c.previous_key_file = src.previous_key_file;
+    c.previous_key_inline = src.previous_key_inline;
     std::string alg = EnvStr("MC_SECURE_AEAD");
     std::transform(alg.begin(), alg.end(), alg.begin(), ::tolower);
     if (alg == "chacha20-poly1305" || alg == "chacha20poly1305")
@@ -473,53 +406,21 @@ SecureConfig SecureConfig::FromEnv() {
 
 std::shared_ptr<const KeyRing> LoadKeyRing(const SecureConfig& cfg, Error* err,
                                            std::string* why) {
+    secure_env::KeySources src;
+    src.key_file = cfg.key_file;
+    src.key_inline = cfg.key_inline;
+    src.previous_key_file = cfg.previous_key_file;
+    src.previous_key_inline = cfg.previous_key_inline;
     std::vector<std::array<uint8_t, kKeySize>> keys;
-    auto fail = [&](Error e, const std::string& reason) {
-        for (auto& k : keys) OPENSSL_cleanse(k.data(), k.size());
-        if (err) *err = e;
-        if (why) *why = reason;
-        return std::shared_ptr<const KeyRing>();
-    };
-    if (!cfg.key_file.empty()) {
-        std::string content;
-        if (!ReadFile(cfg.key_file, &content))
-            return fail(Error::kNoKey, "cannot read MC_SECURE_KEY_FILE " +
-                                           cfg.key_file);
-        Error e = ParseKeyFile(content, &keys);
-        OPENSSL_cleanse(content.data(), content.size());
-        if (e != Error::kOk)
-            return fail(e, "MC_SECURE_KEY_FILE " + cfg.key_file +
-                               " holds no valid key (want 32 raw bytes, 64 hex "
-                               "digits or base64)");
-    } else if (!cfg.key_inline.empty()) {
-        std::array<uint8_t, kKeySize> k;
-        if (ParseKeyMaterial(cfg.key_inline, &k) != Error::kOk)
-            return fail(Error::kBadConfig,
-                        "MC_SECURE_KEY is not 64 hex digits or base64 of 32 "
-                        "bytes");
-        keys.push_back(k);
-    } else {
-        return fail(Error::kNoKey,
-                    "secure mode needs MC_SECURE_KEY_FILE or MC_SECURE_KEY");
-    }
-    if (!cfg.previous_key_file.empty()) {
-        std::string content;
-        if (!ReadFile(cfg.previous_key_file, &content))
-            return fail(Error::kBadConfig,
-                        "cannot read MC_SECURE_PREVIOUS_KEY_FILE " +
-                            cfg.previous_key_file);
-        Error e = ParseKeyFile(content, &keys);
-        OPENSSL_cleanse(content.data(), content.size());
-        if (e != Error::kOk)
-            return fail(Error::kBadConfig,
-                        "MC_SECURE_PREVIOUS_KEY_FILE holds an invalid key");
-    }
-    if (!cfg.previous_key_inline.empty()) {
-        std::array<uint8_t, kKeySize> k;
-        if (ParseKeyMaterial(cfg.previous_key_inline, &k) != Error::kOk)
-            return fail(Error::kBadConfig,
-                        "MC_SECURE_PREVIOUS_KEY is not a valid key");
-        keys.push_back(k);
+    switch (secure_env::LoadKeys(src, &keys, why)) {
+        case secure_env::KeyError::kOk:
+            break;
+        case secure_env::KeyError::kNoKey:
+            if (err) *err = Error::kNoKey;
+            return nullptr;
+        case secure_env::KeyError::kBadConfig:
+            if (err) *err = Error::kBadConfig;
+            return nullptr;
     }
     auto ring = KeyRing::FromKeys(keys, err);
     for (auto& k : keys) OPENSSL_cleanse(k.data(), k.size());
@@ -813,6 +714,13 @@ std::unique_ptr<SecureContext> SecureContext::Build(
     ctx->enabled_ = cfg.enabled;
     if (!cfg.enabled) {
         ctx->status_ = Error::kDisabled;
+        return ctx;
+    }
+    if (!cfg.switch_error.empty()) {
+        ctx->status_ = Error::kBadConfig;
+        ctx->reason_ = cfg.switch_error;
+        LOG(ERROR) << "Mooncake secure mode requested but cannot start: "
+                   << cfg.switch_error;
         return ctx;
     }
     Error e = Error::kOk;

@@ -1,5 +1,7 @@
 #include "control_auth.h"
 
+#include "secure_env.h"
+
 #include <glog/logging.h>
 #include <openssl/crypto.h>
 #include <openssl/hmac.h>
@@ -32,7 +34,10 @@ struct State {
     bool enabled = false;
     bool ready = false;
     std::string error;
-    std::string key;  // derived control-plane key
+    std::string key;  // derived control-plane key (from the current key)
+    // Derived from the previous keys: accepted when verifying, so a key
+    // rotation does not cut the control plane.
+    std::vector<std::string> previous_keys;
     int64_t max_skew_ms = kDefaultMaxSkewMs;
 };
 
@@ -72,30 +77,17 @@ int64_t NowMs() {
         .count();
 }
 
-std::string Lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return s;
-}
-
-std::string TrimTrailingSpace(std::string s) {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
-        s.pop_back();
-    return s;
-}
-
 const State *BuildFromEnvironment() {
     auto *st = new State();
-    const char *flag = std::getenv("MC_CONTROL_AUTH");
-    std::string v = flag ? Lower(flag) : "";
-    if (v.empty() || v == "0" || v == "false" || v == "off" || v == "no") {
-        return st;
-    }
+    // One switch and one key source for both halves of secure mode; see
+    // secure_env.h.
+    const secure_env::Switch sw = secure_env::ReadSwitch();
+    if (!sw.enabled) return st;
     st->enabled = true;
-    if (!(v == "1" || v == "true" || v == "on" || v == "yes")) {
-        st->error = "MC_CONTROL_AUTH has an unrecognised value";
-        LOG(ERROR) << "control-auth: " << st->error << " (" << flag
-                   << "); secure mode is on and fails closed";
+    if (!sw.error.empty()) {
+        st->error = sw.error;
+        LOG(ERROR) << "control-auth: " << st->error
+                   << "; secure mode is on and fails closed";
         return st;
     }
     if (const char *skew = std::getenv("MC_CONTROL_AUTH_MAX_SKEW_MS")) {
@@ -108,18 +100,27 @@ const State *BuildFromEnvironment() {
         }
         st->max_skew_ms = ms;
     }
+    std::vector<secure_env::Key> keys;
     std::string err;
-    auto secret = LoadSecretFromEnvironment(&err);
-    if (!secret) {
+    if (secure_env::LoadKeys(secure_env::ReadKeySources(), &keys, &err) !=
+        secure_env::KeyError::kOk) {
         st->error = err;
         LOG(ERROR) << "control-auth: " << err
                    << "; secure mode is on and fails closed";
         return st;
     }
-    st->key = DeriveKey(*secret, kKeyLabel);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string_view k(reinterpret_cast<const char *>(keys[i].data()),
+                           keys[i].size());
+        if (i == 0)
+            st->key = DeriveKey(k, kKeyLabel);
+        else
+            st->previous_keys.push_back(DeriveKey(k, kKeyLabel));
+        OPENSSL_cleanse(keys[i].data(), keys[i].size());
+    }
     st->ready = true;
     LOG(INFO) << "control-auth: secure mode on, max skew " << st->max_skew_ms
-              << " ms";
+              << " ms, " << st->previous_keys.size() << " previous key(s)";
     return st;
 }
 
@@ -262,42 +263,20 @@ Verdict VerifyTag(Domain domain, std::string_view tag, std::string_view bound) {
     if (tag.size() != kTagSize || memcmp(tag.data(), kMagic, kTagMagicSize))
         return Verdict::kMalformed;
     constexpr size_t header = kTagMagicSize + 8 + kTagNonceSize;
-    auto mac = TagMac(st.key, domain, tag.substr(0, header), bound);
-    if (CRYPTO_memcmp(mac.data(), tag.data() + header, kTagMacSize) != 0)
-        return Verdict::kBadMac;
+    auto mac_ok = [&](const std::string &key) {
+        auto mac = TagMac(key, domain, tag.substr(0, header), bound);
+        return CRYPTO_memcmp(mac.data(), tag.data() + header, kTagMacSize) ==
+               0;
+    };
+    bool ok = mac_ok(st.key);
+    for (size_t i = 0; !ok && i < st.previous_keys.size(); ++i)
+        ok = mac_ok(st.previous_keys[i]);
+    if (!ok) return Verdict::kBadMac;
     const int64_t ts = GetBigEndian64(tag.data() + kTagMagicSize);
     const int64_t now = NowMs();
     if (ts < now - st.max_skew_ms || ts > now + st.max_skew_ms)
         return Verdict::kStale;
     return Remember(tag.data() + kTagMagicSize + 8, ts, now, st.max_skew_ms);
-}
-
-std::optional<std::string> LoadSecretFromEnvironment(std::string *error) {
-    std::string secret;
-    const char *path = std::getenv("MC_CONTROL_AUTH_KEY_FILE");
-    const char *inline_key = std::getenv("MC_CONTROL_AUTH_KEY");
-    if (path && *path) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            *error = std::string("cannot read MC_CONTROL_AUTH_KEY_FILE ") + path;
-            return std::nullopt;
-        }
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        secret = ss.str();
-    } else if (inline_key && *inline_key) {
-        secret = inline_key;
-    } else {
-        *error = "neither MC_CONTROL_AUTH_KEY_FILE nor MC_CONTROL_AUTH_KEY set";
-        return std::nullopt;
-    }
-    secret = TrimTrailingSpace(std::move(secret));
-    if (secret.size() < kMinSecretBytes) {
-        *error = "control-auth secret shorter than " +
-                 std::to_string(kMinSecretBytes) + " bytes";
-        return std::nullopt;
-    }
-    return secret;
 }
 
 std::array<uint8_t, 32> HmacSha256(

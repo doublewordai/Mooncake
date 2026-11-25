@@ -1,28 +1,26 @@
 // Control-plane authentication (secure mode).
 //
-// Every control-plane message — the transfer engine's P2P handshake, the
-// store's coro_rpc requests and the master admin API's privileged routes —
+// Every control-plane message on the two channels covered here — the
+// transfer engine's P2P handshake and the store's coro_rpc requests —
 // carries a tag: an HMAC-SHA256, under a key derived from a shared secret,
 // over a timestamp, a random nonce, the channel it was made for and the data
 // it vouches for. A receiver accepts a tag once, and only within the clock
 // skew window. The secret itself never crosses the network.
 //
 // Built only with -DWITH_SECURE_KV=ON. Even then secure mode is off unless
-// MC_CONTROL_AUTH is set, and off, no hook is installed and the wire format is
-// upstream's. On, a process without a usable secret fails closed: it makes no
+// its switch is set, and off, no hook is installed and the wire format is
+// upstream's. On, a process without a usable key fails closed: it makes no
 // tags and accepts none.
 //
-//   MC_CONTROL_AUTH           1/true/on/yes turns secure mode on; 0/false/off/
-//                             no or unset leaves it off; any other value turns
-//                             it on with a configuration error (fail closed).
-//   MC_CONTROL_AUTH_KEY_FILE  path of the shared secret (a mounted Kubernetes
-//                             Secret). Trailing whitespace is ignored.
-//   MC_CONTROL_AUTH_KEY       the shared secret itself (a secretKeyRef env),
-//                             used when no key file is named.
+// The switch (MC_SECURE_MODE, alias MC_CONTROL_AUTH) and the key
+// (MC_SECURE_KEY_FILE etc.) are shared with the data path; see secure_env.h.
+// The control plane's key is DeriveKey(key, "mooncake control-auth v1"):
+// HMAC-SHA256 under the shared key with a label the data path's HKDF never
+// uses, so the two halves never share a key. Tags are made under the current
+// key and accepted under the current or any previous key.
+//
 //   MC_CONTROL_AUTH_MAX_SKEW_MS  how far a tag's timestamp may differ from the
 //                             receiver's clock (default 30000).
-//
-// The secret must be at least kMinSecretBytes long.
 
 #pragma once
 
@@ -84,15 +82,7 @@ std::string MakeTag(Domain domain, std::string_view bound);
 // forged tags cannot fill it.
 Verdict VerifyTag(Domain domain, std::string_view tag, std::string_view bound);
 
-// ---- Key loading and HMAC -------------------------------------------------
-// These are the parts to merge with the data-path crypto module: it loads the
-// same Kubernetes Secret and derives its own subkeys from it. The control
-// plane's key is DeriveKey(secret, "mooncake control-auth v1"), so the two
-// never share a key even if they share a secret.
-
-// Reads the secret from MC_CONTROL_AUTH_KEY_FILE, else MC_CONTROL_AUTH_KEY.
-// On failure returns nullopt and sets *error.
-std::optional<std::string> LoadSecretFromEnvironment(std::string *error);
+// ---- HMAC -----------------------------------------------------------------
 
 // HMAC-SHA256 over the concatenation of `parts`.
 std::array<uint8_t, 32> HmacSha256(std::string_view key,
@@ -102,8 +92,9 @@ std::array<uint8_t, 32> HmacSha256(std::string_view key,
 std::string DeriveKey(std::string_view secret, std::string_view label);
 
 // ---- Test seams -----------------------------------------------------------
-// Replace the environment-derived state. An empty secret with enabled=true
-// gives the fail-closed state.
+// Replace the environment-derived state with one keyed by `secret` (at least
+// kMinSecretBytes). An empty secret with enabled=true gives the fail-closed
+// state.
 void ConfigureForTesting(bool enabled, std::string secret,
                          int64_t max_skew_ms = kDefaultMaxSkewMs);
 // Forget any configuration so the next call re-reads the environment.

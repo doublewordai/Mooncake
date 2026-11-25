@@ -359,7 +359,20 @@ TEST(CryptoTest2, ContextFailsClosedWithoutKey) {
 
 TEST(CryptoTest2, OffByDefault) {
     unsetenv("MC_SECURE_MODE");
+    unsetenv("MC_CONTROL_AUTH");
     EXPECT_FALSE(SecureConfig::FromEnv().enabled);
+}
+
+// A switch value that is neither on nor off turns secure mode on and fails
+// closed, rather than silently leaving the data path in plaintext.
+TEST(CryptoTest2, UnrecognisedSwitchFailsClosed) {
+    setenv("MC_SECURE_MODE", "ture", 1);
+    setenv("MC_SECURE_KEY", std::string(64, '1').c_str(), 1);
+    auto ctx = SecureContext::CreateForTesting(SecureConfig::FromEnv(), nullptr);
+    EXPECT_TRUE(ctx->enabled());
+    EXPECT_TRUE(ctx->failed());
+    unsetenv("MC_SECURE_MODE");
+    unsetenv("MC_SECURE_KEY");
 }
 
 TEST(StagingPoolTest, AllocateFreeCoalesceAndCap) {

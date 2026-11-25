@@ -4,6 +4,8 @@
 #include "control_auth.h"
 
 #include <gtest/gtest.h>
+
+#include "secure/kv_crypto.h"
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -18,6 +20,18 @@ namespace {
 
 const std::string kSecretA(40, 'a');
 const std::string kSecretB(40, 'b');
+// Keys in the shared key format (secure_env.h): 64 hex digits.
+const std::string kKeyHexA(64, 'a');
+const std::string kKeyHexB(64, 'b');
+
+std::string WriteTempFile(const std::string &content) {
+    char path[] = "/tmp/control_auth_test_keyXXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return "";
+    close(fd);
+    std::ofstream(path) << content;
+    return path;
+}
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -29,6 +43,10 @@ class ControlAuthTest : public ::testing::Test {
    protected:
     void SetUp() override { ConfigureForTesting(true, kSecretA); }
     void TearDown() override {
+        for (const char *v :
+             {"MC_SECURE_MODE", "MC_SECURE_KEY", "MC_SECURE_KEY_FILE",
+              "MC_SECURE_PREVIOUS_KEY", "MC_SECURE_PREVIOUS_KEY_FILE"})
+            unsetenv(v);
         unsetenv("MC_CONTROL_AUTH");
         unsetenv("MC_CONTROL_AUTH_KEY");
         unsetenv("MC_CONTROL_AUTH_KEY_FILE");
@@ -120,22 +138,72 @@ TEST_F(ControlAuthTest, OffByDefault) {
 }
 
 TEST_F(ControlAuthTest, LoadsKeyFromFileIgnoringTrailingNewline) {
-    char path[] = "/tmp/control_auth_test_keyXXXXXX";
-    int fd = mkstemp(path);
-    ASSERT_GE(fd, 0);
-    close(fd);
-    std::ofstream(path) << kSecretA << "\n";
+    const std::string path = WriteTempFile(kKeyHexA + "\n");
+    ASSERT_FALSE(path.empty());
     setenv("MC_CONTROL_AUTH", "1", 1);
-    setenv("MC_CONTROL_AUTH_KEY_FILE", path, 1);
+    setenv("MC_CONTROL_AUTH_KEY_FILE", path.c_str(), 1);
     ResetForTesting();
     EXPECT_TRUE(Ready()) << ConfigError();
     auto tag = MakeTag(Domain::kRpcRequest, "bound");
-    // The same secret given inline derives the same key.
+    // The same key given inline derives the same key.
     unsetenv("MC_CONTROL_AUTH_KEY_FILE");
-    setenv("MC_CONTROL_AUTH_KEY", kSecretA.c_str(), 1);
+    setenv("MC_CONTROL_AUTH_KEY", kKeyHexA.c_str(), 1);
     ResetForTesting();
     EXPECT_EQ(VerifyTag(Domain::kRpcRequest, tag, "bound"), Verdict::kOk);
-    std::remove(path);
+    std::remove(path.c_str());
+}
+
+// One switch and one key file configure both halves of secure mode, and the
+// old control-plane names are aliases of the shared ones.
+TEST_F(ControlAuthTest, OneSwitchAndKeyFileTurnOnBothHalves) {
+    const std::string path = WriteTempFile(kKeyHexA + "\n");
+    ASSERT_FALSE(path.empty());
+    setenv("MC_SECURE_MODE", "1", 1);
+    setenv("MC_SECURE_KEY_FILE", path.c_str(), 1);
+    ResetForTesting();
+    ASSERT_TRUE(Ready()) << ConfigError();
+    auto data = secure::SecureContext::CreateForTesting(
+        secure::SecureConfig::FromEnv(), nullptr);
+    EXPECT_TRUE(data->enabled());
+    EXPECT_FALSE(data->failed()) << data->reason();
+    auto tag = MakeTag(Domain::kRpcRequest, "bound");
+
+    unsetenv("MC_SECURE_MODE");
+    unsetenv("MC_SECURE_KEY_FILE");
+    setenv("MC_CONTROL_AUTH", "1", 1);
+    setenv("MC_CONTROL_AUTH_KEY", kKeyHexA.c_str(), 1);
+    ResetForTesting();
+    EXPECT_EQ(VerifyTag(Domain::kRpcRequest, tag, "bound"), Verdict::kOk);
+    EXPECT_TRUE(secure::SecureConfig::FromEnv().enabled);
+    std::remove(path.c_str());
+}
+
+// A tag made under the previous key still verifies after a rotation, and
+// not once that key is dropped.
+TEST_F(ControlAuthTest, PreviousKeyVerifiesDuringRotation) {
+    setenv("MC_SECURE_MODE", "1", 1);
+    setenv("MC_SECURE_KEY", kKeyHexA.c_str(), 1);
+    ResetForTesting();
+    auto old_tag = MakeTag(Domain::kRpcRequest, "bound");
+    auto old_tag2 = MakeTag(Domain::kRpcRequest, "bound");
+    setenv("MC_SECURE_KEY", kKeyHexB.c_str(), 1);
+    setenv("MC_SECURE_PREVIOUS_KEY", kKeyHexA.c_str(), 1);
+    ResetForTesting();
+    ASSERT_TRUE(Ready()) << ConfigError();
+    EXPECT_EQ(VerifyTag(Domain::kRpcRequest, old_tag, "bound"), Verdict::kOk);
+    unsetenv("MC_SECURE_PREVIOUS_KEY");
+    ResetForTesting();
+    EXPECT_EQ(VerifyTag(Domain::kRpcRequest, old_tag2, "bound"),
+              Verdict::kBadMac);
+}
+
+TEST_F(ControlAuthTest, DisagreeingSwitchesFailClosed) {
+    setenv("MC_SECURE_MODE", "0", 1);
+    setenv("MC_CONTROL_AUTH", "1", 1);
+    setenv("MC_SECURE_KEY", kKeyHexA.c_str(), 1);
+    ResetForTesting();
+    EXPECT_TRUE(Enabled());
+    EXPECT_FALSE(Ready());
 }
 
 TEST_F(ControlAuthTest, ShortSecretFailsClosed) {
@@ -155,7 +223,7 @@ TEST_F(ControlAuthTest, MissingSecretFailsClosed) {
 
 TEST_F(ControlAuthTest, UnrecognisedSwitchValueFailsClosed) {
     setenv("MC_CONTROL_AUTH", "ture", 1);
-    setenv("MC_CONTROL_AUTH_KEY", kSecretA.c_str(), 1);
+    setenv("MC_CONTROL_AUTH_KEY", kKeyHexA.c_str(), 1);
     ResetForTesting();
     EXPECT_TRUE(Enabled());
     EXPECT_FALSE(Ready());

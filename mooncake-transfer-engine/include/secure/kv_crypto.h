@@ -171,13 +171,10 @@ class KeyRing {
 
 // --------------------------------------------------------------- config --
 
-// Environment:
-//   MC_SECURE_MODE                 1/true/on enables secure mode (default off)
-//   MC_SECURE_KEY_FILE             file with the current key; extra non-empty
-//                                  lines are previous keys
-//   MC_SECURE_KEY                  the current key inline (if no key file)
-//   MC_SECURE_PREVIOUS_KEY_FILE    file with previous keys, one per line
-//   MC_SECURE_PREVIOUS_KEY         a previous key inline
+// Environment: the switch (MC_SECURE_MODE) and the key variables
+// (MC_SECURE_KEY_FILE, MC_SECURE_KEY, MC_SECURE_PREVIOUS_KEY_FILE,
+// MC_SECURE_PREVIOUS_KEY) are shared with control-plane authentication and
+// documented in src/secure/secure_env.h. The data path's own settings:
 //   MC_SECURE_AEAD                 aes-256-gcm (default) | chacha20-poly1305;
 //                                  the algorithm this process seals with.
 //                                  Opening accepts both.
@@ -185,6 +182,8 @@ class KeyRing {
 //   MC_SECURE_STAGING_MAX_BYTES    cap on all staging regions (default 4GiB)
 struct SecureConfig {
     bool enabled = false;
+    // Non-empty when the switch is on but misconfigured (fail closed).
+    std::string switch_error;
     std::string key_file;
     std::string key_inline;
     std::string previous_key_file;

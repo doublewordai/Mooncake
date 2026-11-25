@@ -28,7 +28,7 @@ bool RpcAuthEnabled() { return ca::Enabled(); }
 bool RpcAuthEnabledForServer() {
     if (!ca::Enabled()) return false;
     if (!ca::Ready()) {
-        LOG(FATAL) << "Secure mode (MC_CONTROL_AUTH) is on but has no usable "
+        LOG(FATAL) << "Secure mode (MC_SECURE_MODE) is on but has no usable "
                       "key ("
                    << ca::ConfigError() << "); refusing to serve RPC";
     }
@@ -37,7 +37,7 @@ bool RpcAuthEnabledForServer() {
 
 bool RefuseUnauthenticatedListener(const char *what) {
     if (!ca::Enabled()) return false;
-    LOG(ERROR) << "Secure mode (MC_CONTROL_AUTH) refuses to start the "
+    LOG(ERROR) << "Secure mode (MC_SECURE_MODE) refuses to start the "
                << what << ": it has no authentication";
     return true;
 }

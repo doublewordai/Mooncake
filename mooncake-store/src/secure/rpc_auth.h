@@ -6,7 +6,7 @@
 // which checks the tag before the handler body runs and answers a request
 // without a valid one with kUnauthenticated. Clients add the tag in
 // RpcSendRequest. Nothing here is compiled without -DWITH_SECURE_KV=ON, and
-// nothing is installed unless MC_CONTROL_AUTH is on.
+// nothing is installed unless secure mode (MC_SECURE_MODE) is on.
 
 #pragma once
 
@@ -32,7 +32,7 @@ namespace secure {
 // The coro_rpc error code of a refused request.
 constexpr uint16_t kUnauthenticated = 401;
 
-// Whether requests are tagged and checked (MC_CONTROL_AUTH on).
+// Whether requests are tagged and checked (MC_SECURE_MODE on).
 bool RpcAuthEnabled();
 // For servers: like RpcAuthEnabled, but aborts the process if secure mode is
 // on without a usable key, so a misconfigured server never starts serving.

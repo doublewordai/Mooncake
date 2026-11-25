@@ -95,7 +95,7 @@ std::pair<HandShakeRequestType, std::string> ReadAuthenticatedHandshake(
 void OnTransferMetadataCreated(const std::string &conn_string) {
     if (!ca::Enabled()) return;
     if (conn_string != "P2PHANDSHAKE") {
-        LOG(FATAL) << "Secure mode (MC_CONTROL_AUTH) requires the "
+        LOG(FATAL) << "Secure mode (MC_SECURE_MODE) requires the "
                       "P2PHANDSHAKE metadata mode; refusing '"
                    << conn_string << "'";
     }

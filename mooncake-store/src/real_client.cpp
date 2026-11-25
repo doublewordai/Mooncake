@@ -26,6 +26,10 @@
 #include <vector>
 
 #include "real_client.h"
+
+#ifdef WITH_SECURE_KV
+#include "secure/entry_guard.h"
+#endif
 #include "embedded_master.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -999,6 +1003,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+#ifdef WITH_SECURE_KV
+    if (secure::RefuseUnsealedClientSetup())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&

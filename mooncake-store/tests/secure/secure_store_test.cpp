@@ -25,6 +25,7 @@
 
 #include "real_client.h"
 #include "secure/kv_crypto.h"
+#include "store_c.h"
 #include "secure/sealed_object.h"
 #include "secure/secure_py_client.h"
 #include "secure/secure_transport.h"
@@ -493,6 +494,37 @@ TEST_F(SecureStoreTest, PathsThatCannotBeAuthenticatedAreRefused) {
     auto sess = a_->batch_put_session_start({"s"}, {10}, ReplicateConfig{});
     EXPECT_LT(sess[0], 0);
     EXPECT_FALSE(a_->allocate_client_buffer(10).has_value());
+}
+
+// Entry points that do not seal refuse to operate in secure mode: the C API
+// (and so the Rust and Go bindings, which wrap it) creates no client, and a
+// RealClient set up anywhere but inside SecurePyClient refuses setup, so no
+// plaintext put can reach a store segment through it.
+TEST_F(SecureStoreTest, EntryPointsAroundTheDecoratorAreRefused) {
+    EXPECT_EQ(mooncake_store_create(), nullptr);
+
+    auto direct = RealClient::create();
+    EXPECT_NE(direct->setup_real("localhost:17943", "P2PHANDSHAKE", 32 << 20,
+                                 16 << 20, "tcp", "", master_.master_address(),
+                                 nullptr, "", false, "", "default", false,
+                                 DEFAULT_CLIENT_HTTP_PORT),
+              0);
+    EXPECT_NE(direct->initAll("tcp", "", 32 << 20), 0);
+    auto value = Pattern(4096, 9);
+    EXPECT_NE(direct->put_from("direct", value.data(), value.size(),
+                               On("localhost:17943")),
+              0);
+    EXPECT_NE(a_->isExist("direct"), 1);
+
+    // The decorator's own setup is not refused (the fixture set up a_, b_),
+    // and a client set up through it still works.
+    ASSERT_EQ(a_->put_from("sealed", value.data(), value.size(),
+                           On("localhost:17941")),
+              0);
+    std::vector<char> out(value.size());
+    EXPECT_EQ(b_->get_into("sealed", out.data(), out.size()),
+              static_cast<int64_t>(out.size()));
+    EXPECT_EQ(out, value);
 }
 
 TEST_F(SecureStoreTest, PlaintextCannotReachTheFabricEvenThroughTheInner) {

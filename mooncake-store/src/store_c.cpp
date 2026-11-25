@@ -24,6 +24,10 @@
 
 #include "real_client.h"
 #include "replica.h"
+
+#ifdef WITH_SECURE_KV
+#include "secure/entry_guard.h"
+#endif
 #include "types.h"
 
 namespace {
@@ -86,6 +90,10 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 mooncake_store_t mooncake_store_create() {
+#ifdef WITH_SECURE_KV
+    if (mooncake::secure::RefuseUnsealedEntryPoint("the store C API"))
+        return nullptr;
+#endif
     try {
         auto client = mooncake::RealClient::create();
         if (!client) return nullptr;

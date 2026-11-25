@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -405,6 +406,7 @@ std::vector<int64_t> SecurePyClient::GetMany(
     std::vector<uint64_t> sealed_sizes(keys.size(), 0);
     std::vector<std::vector<Buf>> bufs(keys.size());
     std::vector<bool> pending(keys.size(), false);
+    std::vector<void *> local_src(keys.size(), nullptr);
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i >= queries.size() || !queries[i]) {
             results[i] = Err(i < queries.size() ? queries[i].error()
@@ -438,6 +440,74 @@ std::vector<int64_t> SecurePyClient::GetMany(
         }
         sealed_sizes[i] = sealed;
         pending[i] = true;
+        // A replica in this process's own segment is opened where it lies:
+        // the segment is NIC-registered ciphertext memory, as staging is, so
+        // copying it to staging first (the inner client's single memcpy
+        // thread) would only add a pass. Opening verifies every segment as
+        // before; the lease is checked after.
+        if (client_)
+            for (const auto &rep : replicas) {
+                if (!rep.is_memory_replica() || !client_->CanUseLocalMemcpy(rep))
+                    continue;
+                const auto &bd = rep.get_memory_descriptor().buffer_descriptor;
+                void *p = reinterpret_cast<void *>(bd.buffer_address_);
+                if (bd.size_ == sealed && p && DeviceOf(p) < 0)
+                    local_src[i] = p;
+                break;
+            }
+    }
+
+    // Local replicas, all opened at once.
+    {
+        std::vector<ObjectCrypto::OpenJob> jobs;
+        std::vector<size_t> opened;
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (!pending[k] || !local_src[k]) continue;
+            pending[k] = false;
+            ObjectCrypto::OpenJob job;
+            if (!ParseObject({local_src[k], sealed_sizes[k]}, sealed_sizes[k],
+                             &job.layout)) {
+                LOG(ERROR) << "secure mode: key " << keys[k]
+                           << " is not a well-formed sealed object";
+                results[k] = Err(ErrorCode::CHECKSUM_MISMATCH);
+                continue;
+            }
+            uint64_t plain = job.layout.plaintext_len;
+            for (auto &b : bufs[k]) {
+                if (plain == 0) break;
+                const size_t n =
+                    static_cast<size_t>(std::min<uint64_t>(plain, b.size));
+                job.out.push_back({b.data, n, b.device});
+                plain -= n;
+            }
+            if (plain != 0) {
+                LOG(ERROR) << "secure mode: buffer too small for key "
+                           << keys[k]
+                           << ": required=" << job.layout.plaintext_len;
+                results[k] = Err(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            job.key = &keys[k];
+            job.sealed = {local_src[k], sealed_sizes[k]};
+            jobs.push_back(std::move(job));
+            opened.push_back(k);
+        }
+        if (!jobs.empty()) crypto_->Open(jobs);
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            const size_t k = opened[j];
+            if (jobs[j].result != Error::kOk) {
+                results[k] = ErrOf(jobs[j].result);
+            } else if (now >= queries[k]->lease_timeout) {
+                // As the inner client: the replica may have been evicted
+                // while it was read.
+                for (auto &b : jobs[j].out)
+                    if (b.device < 0 && b.size) std::memset(b.data, 0, b.size);
+                results[k] = Err(ErrorCode::LEASE_EXPIRED);
+            } else {
+                results[k] = static_cast<int64_t>(jobs[j].layout.plaintext_len);
+            }
+        }
     }
 
     size_t i = 0;

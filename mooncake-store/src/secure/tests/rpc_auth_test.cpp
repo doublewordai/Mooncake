@@ -101,12 +101,20 @@ class RpcAuthTest : public ::testing::Test {
         ASSERT_FALSE(ec) << ec.message();
     }
 
-    // Sends Put with a chosen attachment; returns the coro_rpc error code.
+    // Sends Put(key) with a chosen attachment; returns the coro_rpc error
+    // code.
     uint16_t PutWith(coro_rpc::coro_rpc_client &client,
-                     std::string_view attachment) {
+                     std::string_view attachment,
+                     const std::string &key = "k") {
         auto r = syncAwait(Flatten(client.send_request_with_attachment<&Store::Put>(
-            attachment, std::string("k"))));
+            attachment, key)));
         return r ? 0 : static_cast<uint16_t>(r.error().code.ec);
+    }
+
+    // A tag for Put(key), as the client seam makes it.
+    static std::string PutToken(const std::string &key = "k") {
+        return secure::MakeRpcToken(coro_rpc::func_id<&Store::Put>(),
+                                    secure::RpcArgsDigest<&Store::Put>(key));
     }
 
     // A request through the client seam, as the Store's clients send them.
@@ -157,8 +165,7 @@ TEST_F(RpcAuthTest, WrongKeyIsRefused) {
     coro_rpc::coro_rpc_client client;
     ASSERT_NO_FATAL_FAILURE(Connect(client));
     ca::ConfigureForTesting(true, kSecretB);
-    const std::string token =
-        secure::MakeRpcToken(coro_rpc::func_id<&Store::Put>());
+    const std::string token = PutToken();
     ca::ConfigureForTesting(true, kSecretA);
     EXPECT_EQ(PutWith(client, token), secure::kUnauthenticated);
     EXPECT_EQ(store.puts.load(), 0);
@@ -169,8 +176,7 @@ TEST_F(RpcAuthTest, ReplayedTokenIsRefused) {
     auto server = Serve(store, nullptr);
     coro_rpc::coro_rpc_client client;
     ASSERT_NO_FATAL_FAILURE(Connect(client));
-    const std::string token =
-        secure::MakeRpcToken(coro_rpc::func_id<&Store::Put>());
+    const std::string token = PutToken();
     EXPECT_EQ(PutWith(client, token), 0);
     EXPECT_EQ(PutWith(client, token), secure::kUnauthenticated);
     EXPECT_EQ(store.puts.load(), 1);
@@ -182,9 +188,9 @@ TEST_F(RpcAuthTest, StaleTokenIsRefused) {
     auto server = Serve(store, nullptr);
     coro_rpc::coro_rpc_client client;
     ASSERT_NO_FATAL_FAILURE(Connect(client));
-    std::string bound(4, '\0');
-    uint32_t id = coro_rpc::func_id<&Store::Put>();
-    for (int i = 3; i >= 0; --i, id >>= 8) bound[i] = char(id & 0xff);
+    const std::string bound =
+        secure::RpcBound(coro_rpc::func_id<&Store::Put>(),
+                         secure::RpcArgsDigest<&Store::Put>(std::string("k")));
     const std::string token = ca::MakeTagAtForTesting(
         ca::Domain::kRpcRequest, bound, NowMs() - 6000);
     EXPECT_EQ(PutWith(client, token), secure::kUnauthenticated);
@@ -196,10 +202,32 @@ TEST_F(RpcAuthTest, TokenForAnotherFunctionIsRefused) {
     auto server = Serve(store, nullptr);
     coro_rpc::coro_rpc_client client;
     ASSERT_NO_FATAL_FAILURE(Connect(client));
-    const std::string token =
-        secure::MakeRpcToken(coro_rpc::func_id<&Store::Other>());
+    const std::string token = secure::MakeRpcToken(
+        coro_rpc::func_id<&Store::Other>(), secure::RpcArgsDigest<&Store::Other>());
     EXPECT_EQ(PutWith(client, token), secure::kUnauthenticated);
     EXPECT_EQ(store.puts.load(), 0);
+}
+
+// An on-path attacker who suppresses a request and reuses its fresh tag with
+// other arguments, within the skew window, is refused: the tag covers the
+// arguments. The same tag with the arguments it was made for is served.
+TEST_F(RpcAuthTest, TokenWithSubstitutedArgumentsIsRefused) {
+    for (bool pooled : {false, true}) {
+        Store store;
+        RpcWorkerPool pool(2);
+        auto server = Serve(store, pooled ? &pool : nullptr);
+        coro_rpc::coro_rpc_client client;
+        ASSERT_NO_FATAL_FAILURE(Connect(client));
+        const std::string token = PutToken("victim");
+        EXPECT_EQ(PutWith(client, token, "victim2"), secure::kUnauthenticated);
+        EXPECT_EQ(PutWith(client, token, ""), secure::kUnauthenticated);
+        EXPECT_EQ(store.puts.load(), 0);
+        // Not consumed by the refusals: a bad MAC never enters the replay
+        // cache.
+        EXPECT_EQ(PutWith(client, token, "victim"), 0);
+        EXPECT_EQ(store.puts.load(), 1);
+        server->stop();
+    }
 }
 
 TEST_F(RpcAuthTest, WorkerPoolHandlersAreGuarded) {

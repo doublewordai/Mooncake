@@ -77,6 +77,9 @@ class SecurePushTest : public ::testing::Test {
         // and many slots.
         setenv("MC_SECURE_P2D_SEGMENT_BYTES", "65536", 1);
         setenv("MC_SECURE_P2D_WINDOW_SEGMENTS", "4", 1);
+        // Ramped first and last segments (16, 32 KiB), so every test
+        // exercises segments of more than one size.
+        setenv("MC_SECURE_P2D_FIRST_SEGMENT_BYTES", "16384", 1);
         setenv("MC_SECURE_P2D_RX_BYTES", std::to_string(4 << 20).c_str(), 1);
         setenv("MC_SECURE_P2D_TIMEOUT_MS", "10000", 1);
         SecureConfig cfg;
@@ -371,7 +374,7 @@ TEST_F(SecurePushTest, TamperedStagingIsDetected) {
         };
     EXPECT_EQ(Transfer(A(), seg, {{src.data(), dst.data(), src.size()}}),
               Transport::TransferStatusEnum::FAILED);
-    EXPECT_EQ(tampered, 1);
+    EXPECT_GE(tampered, 1);
     // Opening failed: the destination holds zeros, never the plaintext.
     for (size_t i = 0; i < dst.size(); ++i) ASSERT_EQ(dst.data()[i], 0) << i;
 }
@@ -586,7 +589,11 @@ TEST_F(SecurePushTest, LargeWindowedTransfer) {
                   .count();
     LOG(INFO) << "large transfer: " << mb << " MiB in " << ms << " ms ("
               << segments << " segments)";
-    EXPECT_EQ(segments.load(), n / 65536);
+    // Every segment sealed exactly once (no reseal on the happy path).
+    EXPECT_EQ(segments.load(),
+              PlanPushSegments(n, 65536, 16384,
+                               PushOptions::FromEnv().threads)
+                  .size());
     ExpectDelivered(pieces);
 }
 
@@ -767,6 +774,49 @@ TEST_F(SecurePushTest, UnauthenticatedFloodFromManyAddressesDoesNotLockOut) {
     FloodThenPush(C(), B(), 138);
 }
 
+// A flood spread one connection per address ties every address. The
+// connection displaced for a newcomer is the one that has waited longest
+// without authenticating, not an arbitrary one of the tied addresses, so a
+// sender's fresh connection (authenticated a round trip after connecting)
+// outlives the flood connections opened before it.
+TEST_F(SecurePushTest, TiedAddressesDisplaceTheStalestConnection) {
+    auto* rx = B().xport->push_service();
+    ASSERT_TRUE(rx->receiver_enabled());
+    const auto opt = PushOptions::FromEnv();
+    if (!RaiseFdLimit(opt.max_preauth + 2048))
+        GTEST_SKIP() << "RLIMIT_NOFILE too low";
+    // Unauthenticated leftovers of earlier tests time out first.
+    ASSERT_TRUE(WaitFor([&] { return rx->control_stats().preauth_conns == 0; },
+                        3 * opt.handshake_timeout_ms));
+    std::vector<int> fds;
+    for (size_t i = 0; i < opt.max_preauth; ++i) {
+        const std::string from = "127.1." + std::to_string(i / 250) + "." +
+                                 std::to_string(2 + i % 250);
+        int fd = ConnectFrom(from, rx->control_host(), rx->control_port());
+        if (fd < 0 && i == 0) GTEST_SKIP() << "cannot connect from " << from;
+        ASSERT_GE(fd, 0) << from;
+        fds.push_back(fd);
+    }
+    ASSERT_TRUE(WaitFor(
+        [&] { return rx->control_stats().preauth_conns >= opt.max_preauth; },
+        opt.handshake_timeout_ms / 2));
+    const auto before = rx->control_stats();
+    int late = ConnectFrom("127.1.250.2", rx->control_host(), rx->control_port());
+    ASSERT_GE(late, 0);
+    ASSERT_TRUE(WaitFor(
+        [&] {
+            return rx->control_stats().evicted_conns > before.evicted_conns;
+        },
+        opt.handshake_timeout_ms / 2));
+    EXPECT_EQ(rx->control_stats().evicted_conns, before.evicted_conns + 1);
+    EXPECT_GE(MsUntilClosed(fds.front(), 1000), 0);  // the stalest went
+    for (size_t i = fds.size() - 8; i < fds.size(); ++i)
+        EXPECT_LT(MsUntilClosed(fds[i], 20), 0) << i;  // newer ones stay
+    EXPECT_LT(MsUntilClosed(late, 20), 0);
+    for (int fd : fds) ::close(fd);
+    ::close(late);
+}
+
 // An unauthenticated connection's length claim over the cap is refused
 // before anything is allocated for it; one at the cap is read and refused
 // as unauthenticated.
@@ -886,6 +936,38 @@ TEST_F(SecurePushTest, UnauthenticatedAndIdleConnectionsAreClosed) {
     ::close(silent);
     ::close(slow);
     ::close(authed);
+}
+
+// The segment plan covers the push exactly, in order, never over the
+// segment size, starting and ending with the small segments.
+TEST(SecurePushOptions, SegmentPlan) {
+    const size_t seg = 2 << 20, first = 256 << 10;
+    for (size_t total : {size_t(1), size_t(4095), size_t(first), size_t(first + 1),
+                         size_t(1) << 20, size_t(7) << 20, size_t(32) << 20,
+                         size_t(230) << 20, (size_t(1) << 30) + 12345}) {
+        for (size_t ramp : {1, 8}) {
+            auto plan = PlanPushSegments(total, seg, first, ramp);
+            ASSERT_FALSE(plan.empty()) << total;
+            size_t off = 0;
+            for (auto& [o, len] : plan) {
+                ASSERT_EQ(o, off) << total;
+                ASSERT_GT(len, 0u) << total;
+                ASSERT_LE(len, seg) << total;
+                off += len;
+            }
+            EXPECT_EQ(off, total);
+            EXPECT_LE(plan.front().second, first) << total;
+            EXPECT_LE(plan.back().second, first) << total;
+        }
+    }
+    // No ramp: full-size segments, the last one partial.
+    for (size_t f : {size_t(0), seg, 2 * seg}) {
+        auto plan = PlanPushSegments(5 * seg + 7, seg, f, 8);
+        ASSERT_EQ(plan.size(), 6u);
+        for (size_t i = 0; i < 5; ++i) EXPECT_EQ(plan[i].second, seg);
+        EXPECT_EQ(plan.back().second, 7u);
+    }
+    EXPECT_TRUE(PlanPushSegments(0, seg, first, 8).empty());
 }
 
 TEST(SecurePushOptions, CpuList) {

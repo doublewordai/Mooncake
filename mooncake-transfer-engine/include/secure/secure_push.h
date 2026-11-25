@@ -19,15 +19,23 @@
 // Sender                                   Receiver
 //   RESERVE(n)  ----- control (TCP) ----->   grants slots of its receive
 //               <----------------------- -   staging (NIC-registered)
-//   per window of segments (default 2 MiB each):
+//   (sealing starts as RESERVE is sent: seals go to the sender's own
+//   staging and do not depend on the slots granted)
+//   per segment, streamed (the first and last few are small, so the pipe
+//   fills and drains quickly; the rest are MC_SECURE_P2D_SEGMENT_BYTES):
 //     copy device->pinned host, seal (kTransfer) into send staging,
-//     fabric WRITE sealed segment ----------> slot
-//     COMMIT(window: slot, sealed length,     checks every destination lies
-//            destination list per segment)    in its local-only registered
+//     fabric WRITE sealed segment ----------> slot (posted as soon as the
+//                                             segment is sealed and its
+//                                             slot is free)
+//     COMMIT(segment: slot, sealed length,    checks every destination lies
+//            destination list)                in its local-only registered
 //               ----- control ----------->    memory, opens slot -> dest
-//               <---- ACK(window) --------    (verify + decrypt, one pass),
-//                                             replies
-//   success only after every window's authenticated ACK.
+//               <---- ACK(segment) -------    (verify + decrypt, one pass),
+//                                             replies in request order;
+//                                             commits are opened in
+//                                             parallel, not one at a time
+//   success only after every segment's authenticated ACK. A slot is reused
+//   only after the ACK of the segment that last held it.
 //
 // Every control message is sealed with Purpose::kControl under the shared
 // key: requests bind the receiver's segment name, replies bind the request's
@@ -82,7 +90,12 @@ namespace secure {
 // Environment (all optional):
 //   MC_SECURE_P2D_THREADS          seal threads and open threads (4 each)
 //   MC_SECURE_P2D_SEGMENT_BYTES    plaintext per sealed segment (2 MiB)
-//   MC_SECURE_P2D_WINDOW_SEGMENTS  segments per commit window (8)
+//   MC_SECURE_P2D_WINDOW_SEGMENTS  half the receive slots a push asks for
+//                                  (asks for 2x this many) (8)
+//   MC_SECURE_P2D_FIRST_SEGMENT_BYTES  plaintext of the first (and last)
+//                                  segments of a push; sizes double up to
+//                                  MC_SECURE_P2D_SEGMENT_BYTES (256 KiB; 0 or
+//                                  at least the segment size: no ramp)
 //   MC_SECURE_P2D_RX_BYTES         receive staging (256 MiB)
 //   MC_SECURE_P2D_TX_BYTES         cap on send staging (1 GiB)
 //   MC_SECURE_P2D_CPUS             CPU list the crypto threads are pinned
@@ -109,6 +122,7 @@ struct PushOptions {
     size_t threads = 4;
     size_t segment_bytes = 2ull << 20;
     size_t window_segments = 8;
+    size_t first_segment_bytes = 256ull << 10;
     size_t rx_bytes = 256ull << 20;
     size_t tx_bytes = 1ull << 30;
     std::vector<int> cpus;
@@ -141,6 +155,17 @@ struct ControlStats {
     size_t preauth_buffer_peak = 0;  // most bytes ever buffered at once for
                                      // unauthenticated frames
 };
+
+// How a push of `total` bytes is cut into segments: (offset, length) pairs
+// covering [0, total) in order, none longer than `segment_bytes`. The first
+// segments are `first_bytes` long, `ramp` of each size, doubling up to
+// `segment_bytes`, and the last few halve back down to `first_bytes`, so the
+// first write starts after sealing a small segment and the receiver's last
+// open is short. `first_bytes` 0 or >= `segment_bytes`: all full-size.
+std::vector<std::pair<size_t, size_t>> PlanPushSegments(size_t total,
+                                                        size_t segment_bytes,
+                                                        size_t first_bytes,
+                                                        size_t ramp);
 
 // Parses "0-3,8,10-11". Returns false on malformed input.
 bool ParseCpuList(const std::string& text, std::vector<int>* out);
@@ -193,8 +218,8 @@ struct PushPiece {
 
 // Test hooks (all optional; never set in production).
 struct PushTestHooks {
-    // Sender: after a window's sealed segments reached the peer and before
-    // its commit is sent. Arguments: peer addresses and sizes of the slots.
+    // Sender: after a commit's sealed segments reached the peer and before
+    // the commit is sent. Arguments: peer addresses and sizes of the slots.
     std::function<void(const std::vector<std::pair<uint64_t, size_t>>&)>
         before_commit;
     // Sender: every RESERVE and COMMIT frame a push sends (sealed bytes,
@@ -218,7 +243,7 @@ class SecurePushService {
     bool receiver_enabled() const;
 
     // Pushes `pieces` to `target` in the background and calls done(true)
-    // only after the peer authenticated every window; done(false) on any
+    // only after the peer authenticated every segment; done(false) on any
     // failure. Returns false (without calling done) if the push could not
     // be started.
     bool PushAsync(Transport::SegmentID target, std::vector<PushPiece> pieces,
@@ -245,9 +270,11 @@ class SecurePushService {
     struct Peer;
     struct Receiver;
     struct Job;
+    struct Stream;
 
    private:
     friend struct Job;
+    friend struct Stream;
     std::shared_ptr<Peer> Discover(Transport::SegmentID target, bool force);
     bool RunJob(Job& job);
     bool EnsureSender();

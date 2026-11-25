@@ -1,7 +1,9 @@
 // Secure-mode authentication of the store's coro_rpc requests.
 //
 // Each request carries, as its coro_rpc request attachment, a control_auth tag
-// bound to the function it calls (its route key). Every handler registered
+// bound to the function it calls (its route key) and to a digest of its
+// arguments (RpcArgsDigest), so a tag lifted from a suppressed request cannot
+// carry other arguments to the same function. Every handler registered
 // through RpcWorkerPool::Register or RpcRegistrar is wrapped in AuthedHandler,
 // which checks the tag before the handler body runs and answers a request
 // without a valid one with kUnauthenticated. Clients add the tag in
@@ -24,6 +26,7 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/struct_pack.hpp>
 #include <ylt/util/type_traits.h>
 
 namespace mooncake {
@@ -50,10 +53,29 @@ bool RefuseUnauthenticatedListener(const char *what);
 // Read once per call, at server construction.
 std::string AdminBindHost(const std::string &requested);
 
-std::string MakeRpcToken(uint32_t func_id);
+// A tag for a call of `func_id` whose arguments have digest `args_digest`
+// (RpcArgsDigest), or empty without a usable key.
+std::string MakeRpcToken(uint32_t func_id, std::string_view args_digest);
 // Throws coro_rpc::rpc_error{kUnauthenticated} unless `attachment` is a valid,
-// fresh, unreplayed tag for `func_id`.
-void CheckRpcTokenOrThrow(std::string_view attachment, uint32_t func_id);
+// fresh, unreplayed tag for `func_id` and `args_digest`.
+void CheckRpcTokenOrThrow(std::string_view attachment, uint32_t func_id,
+                          std::string_view args_digest);
+// What a tag covers: the route key, then the arguments' digest.
+std::string RpcBound(uint32_t func_id, std::string_view args_digest);
+
+// Incremental SHA-256 (rpc_auth.cpp, so OpenSSL stays out of this header).
+class Sha256 {
+   public:
+    Sha256();
+    ~Sha256();
+    Sha256(const Sha256 &) = delete;
+    Sha256 &operator=(const Sha256 &) = delete;
+    void Update(std::string_view data);
+    std::string Final();  // 32 bytes
+
+   private:
+    void *ctx_;
+};
 
 namespace detail {
 
@@ -82,11 +104,51 @@ void KeepForever(std::shared_ptr<void> handler);
 
 }  // namespace detail
 
-template <auto Method>
-async_simple::coro::Lazy<void> CheckCurrentRequest() {
+namespace detail {
+
+// One argument, struct_pack-serialized as the parameter type the server
+// deserializes it into (converting first if the caller passed another type),
+// length-prefixed.
+template <typename Param, typename Arg>
+void HashArg(Sha256 &h, const Arg &arg) {
+    using T = std::remove_cv_t<std::remove_reference_t<Param>>;
+    const T &value = arg;
+    const auto bytes = struct_pack::serialize<std::string>(value);
+    const uint64_t n = bytes.size();
+    h.Update(std::string_view(reinterpret_cast<const char *>(&n), sizeof(n)));
+    h.Update(bytes);
+}
+
+template <auto Method, typename... Args, size_t... I>
+std::string ArgsDigest(std::index_sequence<I...>, const Args &...args) {
+    using P = HandlerParams<Method>;
+    static_assert(sizeof...(Args) == std::tuple_size_v<P>,
+                  "an RPC must pass exactly its method's parameters");
+    Sha256 h;
+    (HashArg<std::tuple_element_t<I, P>>(h, args), ...);
+    return h.Final();
+}
+
+}  // namespace detail
+
+// SHA-256 over a call's arguments as Method's parameter types, each
+// struct_pack-serialized: what the client sends and the server receives
+// serialize the same, so both sides compute the same digest. Every type an
+// authenticated RPC takes must serialize deterministically from its value
+// (no unordered containers).
+template <auto Method, typename... Args>
+std::string RpcArgsDigest(const Args &...args) {
+    return detail::ArgsDigest<Method>(
+        std::index_sequence_for<Args...>{}, args...);
+}
+
+template <auto Method, typename... Params>
+async_simple::coro::Lazy<void> CheckCurrentRequest(const Params &...params) {
+    // Digest before suspending: the parameters belong to the caller's frame.
+    const std::string digest = RpcArgsDigest<Method>(params...);
     auto *ctx = co_await coro_rpc::get_context_in_coro();
     CheckRpcTokenOrThrow(ctx->get_request_attachment(),
-                         coro_rpc::func_id<Method>());
+                         coro_rpc::func_id<Method>(), digest);
 }
 
 // Calls Method on a service as the handler coro_rpc would have registered.
@@ -135,7 +197,7 @@ class AuthedHandler<Method, Inner, std::tuple<Params...>> {
         : inner_(std::move(inner)) {}
 
     async_simple::coro::Lazy<Result> Handle(Params... params) {
-        co_await CheckCurrentRequest<Method>();
+        co_await CheckCurrentRequest<Method>(params...);
         if constexpr (std::is_void_v<Result>) {
             co_await inner_->Handle(std::move(params)...);
         } else {
@@ -178,13 +240,15 @@ bool RegisterDirectAuthed(coro_rpc::coro_rpc_server &server,
     return true;
 }
 
-// client.send_request<Method>(args...) with a tag for Method attached. The
-// tag lives in this coroutine's frame until the request is written.
+// client.send_request<Method>(args...) with a tag for Method and these
+// arguments attached. The tag lives in this coroutine's frame until the
+// request is written.
 template <auto Method, typename... Args>
 auto SendAuthedRequest(coro_rpc::coro_rpc_client &client, Args &&...args)
     -> decltype(client.template send_request<Method>(
         std::forward<Args>(args)...)) {
-    const std::string token = MakeRpcToken(coro_rpc::func_id<Method>());
+    const std::string token = MakeRpcToken(coro_rpc::func_id<Method>(),
+                                           RpcArgsDigest<Method>(args...));
     co_return co_await client.template send_request_with_attachment<Method>(
         std::string_view(token), std::forward<Args>(args)...);
 }

@@ -1,6 +1,7 @@
 #include "rpc_auth.h"
 
 #include <glog/logging.h>
+#include <openssl/evp.h>
 
 #include <cstdlib>
 #include <mutex>
@@ -13,16 +14,39 @@ namespace {
 
 namespace ca = control_auth;
 
-std::string BoundFor(uint32_t func_id) {
+}  // namespace
+
+std::string RpcBound(uint32_t func_id, std::string_view args_digest) {
     std::string b(4, '\0');
     for (int i = 3; i >= 0; --i) {
         b[i] = static_cast<char>(func_id & 0xff);
         func_id >>= 8;
     }
+    b.append(args_digest);
     return b;
 }
 
-}  // namespace
+Sha256::Sha256() : ctx_(EVP_MD_CTX_new()) {
+    auto *c = static_cast<EVP_MD_CTX *>(ctx_);
+    CHECK(c && EVP_DigestInit_ex(c, EVP_sha256(), nullptr) == 1);
+}
+
+Sha256::~Sha256() { EVP_MD_CTX_free(static_cast<EVP_MD_CTX *>(ctx_)); }
+
+void Sha256::Update(std::string_view data) {
+    CHECK(EVP_DigestUpdate(static_cast<EVP_MD_CTX *>(ctx_), data.data(),
+                           data.size()) == 1);
+}
+
+std::string Sha256::Final() {
+    std::string out(32, '\0');
+    unsigned int n = 0;
+    CHECK(EVP_DigestFinal_ex(static_cast<EVP_MD_CTX *>(ctx_),
+                             reinterpret_cast<unsigned char *>(out.data()),
+                             &n) == 1 &&
+          n == 32);
+    return out;
+}
 
 bool RpcAuthEnabled() { return ca::Enabled(); }
 
@@ -56,8 +80,9 @@ std::string AdminBindHost(const std::string &requested) {
     return host;
 }
 
-std::string MakeRpcToken(uint32_t func_id) {
-    std::string tag = ca::MakeTag(ca::Domain::kRpcRequest, BoundFor(func_id));
+std::string MakeRpcToken(uint32_t func_id, std::string_view args_digest) {
+    std::string tag =
+        ca::MakeTag(ca::Domain::kRpcRequest, RpcBound(func_id, args_digest));
     if (tag.empty()) {
         LOG_EVERY_N(ERROR, 1000)
             << "Secure mode has no usable key (" << ca::ConfigError()
@@ -66,9 +91,10 @@ std::string MakeRpcToken(uint32_t func_id) {
     return tag;
 }
 
-void CheckRpcTokenOrThrow(std::string_view attachment, uint32_t func_id) {
-    auto verdict =
-        ca::VerifyTag(ca::Domain::kRpcRequest, attachment, BoundFor(func_id));
+void CheckRpcTokenOrThrow(std::string_view attachment, uint32_t func_id,
+                          std::string_view args_digest) {
+    auto verdict = ca::VerifyTag(ca::Domain::kRpcRequest, attachment,
+                                 RpcBound(func_id, args_digest));
     if (verdict == ca::Verdict::kOk) return;
     LOG_EVERY_N(WARNING, 100) << "Refused unauthenticated RPC (route key "
                               << func_id << "): " << ca::VerdictName(verdict);

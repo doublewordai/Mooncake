@@ -19,8 +19,12 @@ void HAMetricManager::reset_snapshot_runtime(bool enabled) {
     std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
     const auto lease_lost = snapshot_runtime_.lease_lost_total;
     const auto floor_advances = snapshot_runtime_.floor_advances_total;
+    const auto reset_epoch = snapshot_runtime_.reset_epoch;
+    const auto resets = snapshot_runtime_.resets_total;
     snapshot_runtime_ = {};
     snapshot_runtime_.lease_lost_total = lease_lost;
+    snapshot_runtime_.reset_epoch = reset_epoch;
+    snapshot_runtime_.resets_total = resets;
     snapshot_runtime_.floor_advances_total = floor_advances;
     snapshot_runtime_.enabled = enabled;
     snapshot_runtime_.skip_reason =
@@ -557,6 +561,9 @@ std::string HAMetricManager::serialize_metrics() {
         ss << "# TYPE ha_snapshot_lease_lost_total "
               "counter\nha_snapshot_lease_lost_total "
            << snapshot.lease_lost_total << "\n";
+        gauge("reset_epoch", snapshot.reset_epoch);
+        ss << "# TYPE ha_snapshot_resets_total counter\nha_snapshot_resets_total "
+           << snapshot.resets_total << "\n";
         static constexpr const char* reasons[] = {
             "none",         "disabled",
             "interval",     "in_flight",

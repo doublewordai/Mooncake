@@ -101,6 +101,10 @@ class HAMetricManager {
         uint64_t gc_orphan_prefixes{0};
         uint64_t gc_deleted_prefixes{0};
         uint64_t lease_lost_total{0};
+        // The cluster's snapshot epoch as last read from etcd (0 before the
+        // first reset to empty), and resets this process performed.
+        uint64_t reset_epoch{0};
+        uint64_t resets_total{0};
         SnapshotSkipReason skip_reason{SnapshotSkipReason::Disabled};
     };
     struct SnapshotOperationStats {

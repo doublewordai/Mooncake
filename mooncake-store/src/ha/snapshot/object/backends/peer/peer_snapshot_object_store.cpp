@@ -20,7 +20,9 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "crc32c.h"
+#include "ha_metric_manager.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "rpc_registrar.h"
@@ -106,6 +108,14 @@ std::string PeerSnapshotRegistryPrefix(const std::string& cluster_id) {
     return "mooncake-store/" + normalized + "/snapshot_peers/";
 }
 
+std::string PeerSnapshotEpochKey(const std::string& cluster_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    return "mooncake-store/" + normalized + "/snapshot_epoch";
+}
+
 PeerSnapshotStoreOptions PeerSnapshotStoreOptions::FromEnvironment(
     std::string cluster_id) {
     PeerSnapshotStoreOptions options;
@@ -123,6 +133,17 @@ PeerSnapshotStoreOptions PeerSnapshotStoreOptions::FromEnvironment(
                 "integer");
         }
         options.min_holders = value;
+    }
+    const std::string grace = Env("MOONCAKE_SNAPSHOT_PEER_RESET_GRACE_S");
+    if (!grace.empty()) {
+        char* end = nullptr;
+        const long value = std::strtol(grace.c_str(), &end, 10);
+        if (*end != '\0' || value < 0) {
+            throw std::invalid_argument(
+                "MOONCAKE_SNAPSHOT_PEER_RESET_GRACE_S must be a non-negative "
+                "integer");
+        }
+        options.reset_grace = std::chrono::seconds(value);
     }
     if (options.local_path.empty()) {
         throw std::invalid_argument(
@@ -439,6 +460,18 @@ std::optional<std::string> PeerSnapshotObjectStore::FetchFromPeer(
     return std::nullopt;
 }
 
+bool PeerSnapshotObjectStore::PeerAnswersFor(const std::string& address,
+                                             const std::string& key) {
+    coro_rpc::coro_rpc_client client;
+    client.get_config().request_timeout_duration = options_.connect_timeout;
+    if (async_simple::coro::syncAwait(client.connect(
+            std::string_view(address), options_.connect_timeout))) {
+        return false;
+    }
+    auto stat = Call<&PeerSnapshotService::Stat>(client, key);
+    return stat && stat->result().status == PeerSnapshotService::kOk;
+}
+
 std::optional<std::string> PeerSnapshotObjectStore::FetchFromPeers(
     const std::string& key) {
     if (!service_->Resolve(key)) {
@@ -623,12 +656,36 @@ void PeerSnapshotObjectStore::Announce(bool force) {
 }
 
 void PeerSnapshotObjectStore::Tick() {
+    // A reset elsewhere made every local snapshot stale.
+    std::string epoch;
+    const ErrorCode epoch_error =
+        backend_.Get(PeerSnapshotEpochKey(options_.cluster_id), epoch);
+    if (epoch_error == ErrorCode::OK || epoch_error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        std::optional<std::string> now_epoch;
+        if (epoch_error == ErrorCode::OK) now_epoch = epoch;
+        if (seen_epoch_ && *seen_epoch_ != now_epoch.value_or("")) {
+            LOG(WARNING) << "Peer snapshot store: snapshot epoch changed to "
+                         << now_epoch.value_or("(none)")
+                         << "; dropping local snapshots";
+            WipeLocalSnapshots();
+        }
+        seen_epoch_ = now_epoch.value_or("");
+        const uint64_t value =
+            std::strtoull(seen_epoch_->c_str(), nullptr, 10);
+        HAMetricManager::instance().update_snapshot_runtime(
+            [value](auto& metrics) { metrics.reset_epoch = value; });
+    }
+
     std::optional<uint64_t> keep_from;
+    std::optional<std::string> raw[2];
+    int i = 0;
     for (const auto& key :
          {ha::BuildBatchOpLogSnapshotLatestKey(options_.cluster_id),
           ha::BuildBatchOpLogSnapshotFallbackKey(options_.cluster_id)}) {
         std::string pointer;
+        const int slot = i++;
         if (backend_.Get(key, pointer) != ErrorCode::OK) continue;
+        raw[slot] = pointer;
         const auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(pointer);
         if (!descriptor) continue;
         keep_from = std::min(keep_from.value_or(UINT64_MAX),
@@ -649,6 +706,190 @@ void PeerSnapshotObjectStore::Tick() {
             LOG(INFO) << "Peer snapshot store: removed expired entry " << key;
         }
     }
+    MaybeReset(raw[0], raw[1]);
+}
+
+void PeerSnapshotObjectStore::WipeLocalSnapshots() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        verified_.clear();
+    }
+    std::error_code ec;
+    fs::remove_all(base_ / namespace_prefix_, ec);
+}
+
+void PeerSnapshotObjectStore::FinishReset() {
+    const std::string& c = options_.cluster_id;
+    const std::string first = BuildBatchRecordKey(c, 0);
+    std::string batches = first.substr(0, first.rfind('/') + 1);
+    std::string batches_end = batches;
+    batches_end.back() = static_cast<char>(batches_end.back() + 1);
+    // Batches before the durable prefix, the prefix before the floor, the
+    // floor before the pointers: a standby restoring in between sees either a
+    // floor it cannot reach (and waits) or nothing at all (and starts empty).
+    const std::string floor_key = ha::BuildBatchOpLogSnapshotCompactionFloorKey(c);
+    const std::string prefix_key = BuildDurablePrefixKey(c);
+    for (const auto& [begin, end] :
+         {std::pair{batches, batches_end},
+          std::pair{prefix_key, prefix_key + '\0'},
+          std::pair{floor_key, floor_key + '\0'}}) {
+        const ErrorCode err = backend_.DeleteRange(begin, end);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Peer snapshot store: reset of cluster " << c
+                       << " stopped deleting at " << begin << " ("
+                       << toString(err) << "); a later tick finishes it";
+            return;
+        }
+    }
+    for (const auto& key : {ha::BuildBatchOpLogSnapshotLatestKey(c),
+                            ha::BuildBatchOpLogSnapshotFallbackKey(c)}) {
+        std::string value;
+        if (backend_.Get(key, value) == ErrorCode::OK &&
+            value == kPeerSnapshotResetMarker) {
+            backend_.DeleteRange(key, key + '\0');
+        }
+    }
+    WipeLocalSnapshots();
+    LOG(ERROR) << "Peer snapshot store: RESET of cluster " << c
+               << " complete: the OpLog and snapshot pointers are gone and "
+                  "the next leader starts with an empty index";
+}
+
+void PeerSnapshotObjectStore::MaybeReset(
+    const std::optional<std::string>& latest,
+    const std::optional<std::string>& fallback) {
+    if (options_.reset_grace.count() <= 0) return;
+    const std::string& c = options_.cluster_id;
+    const std::string view_key = "mooncake-store/" + c + "/master_view";
+    std::string view;
+    const ErrorCode view_error = backend_.Get(view_key, view);
+    if (view_error != ErrorCode::OK && view_error != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return;
+    }
+    const bool view_exists = view_error == ErrorCode::OK;
+    // A view that is not a warming marker is a leader serving.
+    const bool leader_serving =
+        view_exists && !view.starts_with("__mooncake_service_warming__:");
+    auto reset_clock = [&](const char* why) {
+        if (unrestorable_since_) {
+            LOG(WARNING) << "Peer snapshot store: cluster " << c
+                         << " no longer pending reset: " << why;
+        }
+        unrestorable_since_.reset();
+    };
+    if (leader_serving) return reset_clock("a leader is serving");
+
+    if (latest.value_or("") == kPeerSnapshotResetMarker ||
+        fallback.value_or("") == kPeerSnapshotResetMarker) {
+        LOG(ERROR) << "Peer snapshot store: finishing an interrupted reset of "
+                   << c;
+        FinishReset();
+        return reset_clock("reset finished");
+    }
+
+    std::string floor_value;
+    uint64_t floor = 0;
+    if (backend_.Get(ha::BuildBatchOpLogSnapshotCompactionFloorKey(c),
+                     floor_value) != ErrorCode::OK) {
+        return reset_clock("no compaction floor");
+    }
+    {
+        char* end = nullptr;
+        floor = std::strtoull(floor_value.c_str(), &end, 10);
+        if (floor == 0) return reset_clock("floor is 0");
+    }
+    // Usable: a pointer at or above the floor that some live master holds.
+    const auto peers = LivePeers();
+    for (const auto* pointer : {&latest, &fallback}) {
+        if (!*pointer) continue;
+        const auto d = ha::DecodeBatchOpLogSnapshotDescriptor(**pointer);
+        if (!d || d->last_included_batch_id < floor) continue;
+        if (HeldSnapshots().contains(d->snapshot_id)) {
+            return reset_clock("this master holds a snapshot");
+        }
+        // A registry entry stays fresh for a while after its master dies:
+        // a holder counts only if it answers for the snapshot now.
+        const std::string descriptor_key =
+            ha::BuildBatchOpLogSnapshotDescriptorKey(snapshot_root_,
+                                                     d->snapshot_id);
+        for (const auto& peer : peers) {
+            if (peer.held.contains(d->snapshot_id) &&
+                PeerAnswersFor(peer.address, descriptor_key)) {
+                return reset_clock("a live master holds a snapshot");
+            }
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!unrestorable_since_) {
+        unrestorable_since_ = now;
+        LOG(ERROR) << "Peer snapshot store: cluster " << c
+                   << " cannot be restored: the OpLog is pruned through batch "
+                   << floor << " and no live master holds the latest or "
+                   << "fallback snapshot. Resetting it to empty in "
+                   << options_.reset_grace.count() / 1000
+                   << " s unless a holder or a leader appears";
+        return;
+    }
+    if (now - *unrestorable_since_ < options_.reset_grace) return;
+
+    // Fence on everything observed: any change since means someone else moved.
+    std::string epoch;
+    const ErrorCode epoch_error = backend_.Get(PeerSnapshotEpochKey(c), epoch);
+    if (epoch_error != ErrorCode::OK && epoch_error != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return;
+    }
+    const bool epoch_exists = epoch_error == ErrorCode::OK;
+    const uint64_t next_epoch =
+        (epoch_exists ? std::strtoull(epoch.c_str(), nullptr, 10) : 0) + 1;
+    auto same = [](const std::string& key,
+                   const std::optional<std::string>& value) {
+        return value ? KvCompare{.key = key,
+                                 .kind = KvCompareKind::kValueEquals,
+                                 .expected_value = *value}
+                     : KvCompare{.key = key,
+                                 .kind = KvCompareKind::kKeyNotExists};
+    };
+    KvTxn txn;
+    txn.compares = {
+        same(ha::BuildBatchOpLogSnapshotLatestKey(c), latest),
+        same(ha::BuildBatchOpLogSnapshotFallbackKey(c), fallback),
+        same(ha::BuildBatchOpLogSnapshotCompactionFloorKey(c), floor_value),
+        same(view_key, view_exists ? std::optional<std::string>(view)
+                                   : std::nullopt),
+        same(ha::BuildBatchOpLogSnapshotMaintenanceKey(c), std::nullopt),
+        same(PeerSnapshotEpochKey(c),
+             epoch_exists ? std::optional<std::string>(epoch) : std::nullopt)};
+    txn.puts = {{.key = ha::BuildBatchOpLogSnapshotLatestKey(c),
+                 .value = kPeerSnapshotResetMarker},
+                {.key = ha::BuildBatchOpLogSnapshotFallbackKey(c),
+                 .value = kPeerSnapshotResetMarker},
+                {.key = PeerSnapshotEpochKey(c),
+                 .value = std::to_string(next_epoch)}};
+    const ErrorCode err = backend_.Txn(txn);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Peer snapshot store: reset of " << c
+                     << " not taken (" << toString(err)
+                     << "); the cluster changed or another master reset it";
+        unrestorable_since_.reset();
+        return;
+    }
+    seen_epoch_ = std::to_string(next_epoch);
+    HAMetricManager::instance().update_snapshot_runtime([next_epoch](auto& m) {
+        m.reset_epoch = next_epoch;
+        ++m.resets_total;
+    });
+    LOG(ERROR) << "Peer snapshot store: RESETTING cluster " << c
+               << " to EMPTY (snapshot epoch " << next_epoch
+               << "): unrestorable for "
+               << std::chrono::duration_cast<std::chrono::seconds>(
+                      now - *unrestorable_since_)
+                      .count()
+               << " s with the OpLog pruned through batch " << floor
+               << " and no live holder of its snapshots. Every cached object "
+                  "is forgotten; clients see misses";
+    unrestorable_since_.reset();
+    FinishReset();
 }
 
 std::unique_ptr<SnapshotObjectStore> CreatePeerSnapshotObjectStore(

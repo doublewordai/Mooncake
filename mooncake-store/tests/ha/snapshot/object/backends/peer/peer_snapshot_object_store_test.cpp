@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <thread>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -78,6 +80,7 @@ class MemBackend final : public HaKvBackend {
     }
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
+        if (before_txn) before_txn();
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& c : txn.compares) {
             auto it = values_.find(c.key);
@@ -97,6 +100,8 @@ class MemBackend final : public HaKvBackend {
         for (const auto& [key, value] : values_) n += key.starts_with(prefix);
         return n;
     }
+
+    std::function<void()> before_txn;
 
    private:
     std::mutex mutex_;
@@ -127,7 +132,9 @@ class PeerSnapshotStoreTest : public ::testing::Test {
     }
 
     // A master's snapshot store on a pod of its own: its own empty directory.
-    PeerSnapshotObjectStore& Start(int i, size_t min_holders = 2) {
+    PeerSnapshotObjectStore& Start(
+        int i, size_t min_holders = 2,
+        std::chrono::milliseconds reset_grace = std::chrono::milliseconds(0)) {
         PeerSnapshotStoreOptions options;
         options.cluster_id = kCluster;
         options.local_path = dir_ + "/m" + std::to_string(i);
@@ -135,6 +142,7 @@ class PeerSnapshotStoreTest : public ::testing::Test {
         options.min_holders = min_holders;
         options.background = false;
         options.connect_timeout = std::chrono::milliseconds(500);
+        options.reset_grace = reset_grace;
         masters_[i] =
             std::make_unique<PeerSnapshotObjectStore>(options, backend_);
         return *masters_[i];
@@ -458,6 +466,170 @@ TEST_F(PeerSnapshotStoreTest, ServesOnlyTheSnapshotNamespace) {
         EXPECT_EQ(PeerSnapshotService::kRefused, read->status);
         EXPECT_TRUE(read->data.empty());
     }
+}
+
+// ------------------------------------------------------------ reset to empty
+
+class PeerSnapshotResetTest : public PeerSnapshotStoreTest {
+   protected:
+    static constexpr auto kGrace = std::chrono::milliseconds(300);
+    void SetUp() override {
+        PeerSnapshotStoreTest::SetUp();
+        // No snapshot maintenance in progress (a held lock fences the reset).
+        const auto lock = ha::BuildBatchOpLogSnapshotMaintenanceKey(kCluster);
+        backend_.DeleteRange(lock, lock + '\0');
+    }
+    // Every holder of the only snapshot is gone and the OpLog was pruned
+    // behind it: a fresh master cannot restore.
+    void LoseEveryHolder() {
+        AppendBatches(1, 7, {{6, "key-3"}});
+        auto& a = Start(0);
+        Publish(a, 5, 10);
+        backend_.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey(kCluster),
+                     "5");
+        backend_.DeleteRange(BuildBatchRecordKey(kCluster, 0),
+                             BuildBatchRecordRange(kCluster, 5).begin_key);
+        a.Tick();
+        Stop(0);
+    }
+    std::string Get(const std::string& key) {
+        std::string value;
+        return backend_.Get(key, value) == ErrorCode::OK ? value : "(absent)";
+    }
+    std::string Epoch() { return Get(PeerSnapshotEpochKey(kCluster)); }
+    // Ticks for longer than the grace period.
+    void TickPastGrace(PeerSnapshotObjectStore& m) {
+        m.Tick();
+        std::this_thread::sleep_for(kGrace + std::chrono::milliseconds(50));
+        m.Tick();
+    }
+    const std::string view_key_ = "mooncake-store/" + kCluster + "/master_view";
+};
+
+TEST_F(PeerSnapshotResetTest, UnrestorableClusterStartsEmptyAfterGrace) {
+    LoseEveryHolder();
+    auto& b = Start(1, 2, kGrace);
+    auto stuck = Restore(b);
+    ASSERT_FALSE(stuck.result);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, stuck.result.error());
+
+    b.Tick();  // starts the grace period; nothing changes yet
+    EXPECT_EQ("(absent)", Epoch());
+    EXPECT_EQ(2u, BatchCount());
+    std::this_thread::sleep_for(kGrace + std::chrono::milliseconds(50));
+    const auto resets_before =
+        HAMetricManager::instance().get_snapshot_runtime().resets_total;
+    b.Tick();
+    EXPECT_EQ("1", Epoch());
+    // Visible on the master's /metrics (ha_snapshot_reset_epoch).
+    EXPECT_EQ(1u,
+              HAMetricManager::instance().get_snapshot_runtime().reset_epoch);
+    EXPECT_EQ(resets_before + 1,
+              HAMetricManager::instance().get_snapshot_runtime().resets_total);
+    EXPECT_EQ(0u, BatchCount());
+    EXPECT_EQ("(absent)", Get(BuildDurablePrefixKey(kCluster)));
+    EXPECT_EQ("(absent)", Floor().empty() ? "(absent)" : Floor());
+    EXPECT_EQ("(absent)",
+              Get(ha::BuildBatchOpLogSnapshotLatestKey(kCluster)));
+    EXPECT_EQ("(absent)",
+              Get(ha::BuildBatchOpLogSnapshotFallbackKey(kCluster)));
+
+    // Empty, not partial: no object of the lost snapshot, no suffix object.
+    auto restored = Restore(b);
+    ASSERT_TRUE(restored.result) << toString(restored.result.error());
+    EXPECT_EQ(0u, restored.metadata->GetKeyCount());
+    EXPECT_EQ(0u, restored.result->last_applied_batch_id);
+    // Nothing left to reset: further ticks change nothing.
+    TickPastGrace(b);
+    EXPECT_EQ("1", Epoch());
+}
+
+TEST_F(PeerSnapshotResetTest, OneLiveHolderPreventsReset) {
+    AppendBatches(1, 7);
+    auto& a = Start(0);
+    Publish(a, 5, 10);
+    backend_.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey(kCluster), "5");
+    a.Tick();
+    auto& b = Start(1, 2, kGrace);
+    TickPastGrace(b);
+    EXPECT_EQ("(absent)", Epoch());
+    EXPECT_EQ("5", Floor());
+    auto restored = Restore(b);
+    ASSERT_TRUE(restored.result) << toString(restored.result.error());
+    EXPECT_EQ(10u, restored.metadata->GetKeyCount());
+}
+
+TEST_F(PeerSnapshotResetTest, RefusedWhileALeaderIsServing) {
+    LoseEveryHolder();
+    auto& b = Start(1, 2, kGrace);
+    backend_.Put(view_key_, "10.0.0.1:50151");
+    TickPastGrace(b);
+    TickPastGrace(b);
+    EXPECT_EQ("(absent)", Epoch());
+    EXPECT_EQ("5", Floor());
+    // A warming leader is not serving: the grace period runs.
+    backend_.Put(view_key_, "__mooncake_service_warming__:42");
+    TickPastGrace(b);
+    EXPECT_EQ("1", Epoch());
+}
+
+TEST_F(PeerSnapshotResetTest, LeaderAppearingBeforeTheTransactionWins) {
+    LoseEveryHolder();
+    auto& b = Start(1, 2, kGrace);
+    b.Tick();
+    std::this_thread::sleep_for(kGrace + std::chrono::milliseconds(50));
+    // Between the last check and the fenced transaction a leader is elected.
+    backend_.before_txn = [&] {
+        backend_.before_txn = nullptr;
+        backend_.Put(view_key_, "10.0.0.1:50151");
+    };
+    b.Tick();
+    EXPECT_EQ("(absent)", Epoch());
+    EXPECT_EQ("5", Floor());
+    EXPECT_EQ(2u, BatchCount());
+}
+
+TEST_F(PeerSnapshotResetTest, OnlyOneOfTwoStuckMastersResets) {
+    LoseEveryHolder();
+    auto& b = Start(1, 2, kGrace);
+    auto& c = Start(2, 2, kGrace);
+    b.Tick();
+    c.Tick();
+    std::this_thread::sleep_for(kGrace + std::chrono::milliseconds(50));
+    // C resets in the middle of B's attempt; B's transaction must fail.
+    backend_.before_txn = [&] {
+        backend_.before_txn = nullptr;
+        c.Tick();
+    };
+    b.Tick();
+    EXPECT_EQ("1", Epoch());
+}
+
+TEST_F(PeerSnapshotResetTest, RefusedWhileSnapshotMaintenanceIsHeld) {
+    LoseEveryHolder();
+    backend_.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey(kCluster), kOwner);
+    auto& b = Start(1, 2, kGrace);
+    TickPastGrace(b);
+    EXPECT_EQ("(absent)", Epoch());
+    EXPECT_EQ("5", Floor());
+}
+
+TEST_F(PeerSnapshotResetTest, AnyMasterFinishesAnInterruptedReset) {
+    LoseEveryHolder();
+    // The resetting master died right after its transaction.
+    backend_.Put(PeerSnapshotEpochKey(kCluster), "1");
+    backend_.Put(ha::BuildBatchOpLogSnapshotLatestKey(kCluster),
+                 kPeerSnapshotResetMarker);
+    backend_.Put(ha::BuildBatchOpLogSnapshotFallbackKey(kCluster),
+                 kPeerSnapshotResetMarker);
+    auto& c = Start(2, 2, kGrace);
+    // Before it is finished, a standby cannot restore (the floor stands).
+    EXPECT_FALSE(Restore(c).result);
+    c.Tick();
+    EXPECT_EQ(0u, BatchCount());
+    auto restored = Restore(c);
+    ASSERT_TRUE(restored.result) << toString(restored.result.error());
+    EXPECT_EQ(0u, restored.metadata->GetKeyCount());
 }
 
 #ifdef MOONCAKE_WITH_SECURE_KV

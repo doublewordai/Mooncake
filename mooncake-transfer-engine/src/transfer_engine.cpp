@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+#include "secure_mode_guard.h"
 
 namespace mooncake {
 namespace {

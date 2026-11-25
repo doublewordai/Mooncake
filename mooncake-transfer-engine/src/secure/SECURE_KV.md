@@ -1,0 +1,98 @@
+# Secure KV mode (WITH_SECURE_KV)
+
+Secure mode keeps KV-cache plaintext off the fabric and authenticates the
+control plane, for deployments (Isambard) where the network between nodes is
+not trusted. It has two halves that share one switch and one key:
+
+- **Data path** (`kv_crypto`, `secure_transport`, `secure_push`, the store's
+  `SecurePyClient`): every byte that leaves a process over the transfer engine
+  or the store is sealed with an AEAD and verified before use.
+- **Control plane** (`control_auth`, `handshake_auth`, the store's
+  `rpc_auth`): every P2P handshake message and every store coro_rpc request
+  carries an HMAC tag; untagged, forged, stale or replayed messages are
+  refused.
+
+The code lives in `src/secure/` directories (and `include/secure/`) and is
+compiled only with `-DWITH_SECURE_KV=ON` (needs OpenSSL libcrypto). With the
+option off (the default) none of it is built and the wire formats are
+upstream's.
+
+## Switching it on
+
+| Variable | Meaning |
+| --- | --- |
+| `MC_SECURE_MODE` | `1`/`true`/`on`/`yes` turns both halves on. Unset, empty or `0`/`false`/`off`/`no`: off. Any other value: on, with a configuration error (fails closed). `MC_CONTROL_AUTH` is an alias; if both are set they must agree. |
+| `MC_SECURE_KEY_FILE` | Path of the key file, normally a mounted Kubernetes Secret. |
+| `MC_SECURE_KEY` | One key inline (e.g. a `secretKeyRef` env), used only when no key file is named. |
+| `MC_SECURE_PREVIOUS_KEY_FILE`, `MC_SECURE_PREVIOUS_KEY` | Previous keys, accepted for opening/verifying only. |
+
+`MC_CONTROL_AUTH_KEY_FILE` / `MC_CONTROL_AUTH_KEY` are read as aliases of
+`MC_SECURE_KEY_FILE` / `MC_SECURE_KEY` when neither of those is set.
+The authoritative list, with parsing rules, is
+[`secure_env.h`](secure_env.h); tunables specific to one half are in
+[`include/secure/kv_crypto.h`](../../include/secure/kv_crypto.h),
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h) and
+[`control_auth.h`](control_auth.h).
+
+A binary built **without** `WITH_SECURE_KV` refuses to start (exit 78, a
+message on stderr) if `MC_SECURE_MODE` or `MC_CONTROL_AUTH` asks for secure
+mode, so a wrong image cannot silently run in plaintext
+([`mooncake-common/include/secure_mode_guard.h`](../../../mooncake-common/include/secure_mode_guard.h)).
+
+## The key file
+
+One Secret serves every process (prefill, decode, store clients, master).
+The file holds either exactly 32 raw bytes, or one key per line as 64 hex
+digits or base64 of 32 bytes (`#` lines are comments). The first key is
+current; later lines are previous keys. Generate one with
+`openssl rand -hex 32`.
+
+```yaml
+env:
+- {name: MC_SECURE_MODE, value: "1"}
+- {name: MC_SECURE_KEY_FILE, value: /etc/mooncake-secure/key}
+volumeMounts:
+- {name: mooncake-secure, mountPath: /etc/mooncake-secure, readOnly: true}
+volumes:
+- name: mooncake-secure
+  secret: {secretName: mooncake-secure-kv, items: [{key: key, path: key}]}
+```
+
+Each half derives its own keys from the shared key and never uses it
+directly: the data path through HKDF-SHA256 with its own labels (per purpose,
+plus a key id), the control plane as HMAC-SHA256(key,
+`"mooncake control-auth v1"`). The labels differ, so the halves never share a
+key.
+
+Rotation: put the new key on the first line and the old one after it (or in
+`MC_SECURE_PREVIOUS_KEY_FILE`), roll that out everywhere, then drop the old
+key. Both halves seal/tag with the current key and accept current or
+previous. Keys are read once per process, on first use: restart pods to
+pick up a changed Secret.
+
+## Fail-closed behaviour
+
+Secure mode switched on but unusable (unreadable or malformed key, bad switch
+value) never falls back to plaintext: the transfer engine refuses to install
+transports, servers that would serve RPC abort, and the control plane makes
+and accepts no tags.
+
+## What secure mode refuses
+
+- Metadata other than `P2PHANDSHAKE` (etcd, redis, HTTP): the engine aborts at
+  start, since only the P2P handshake is authenticated.
+- The master's HTTP metadata server.
+- TENT (it does not go through the secure transport).
+- Transfers whose local side is not registered memory, and READs into
+  local-only (plaintext) memory. Plaintext memory (a vLLM KV cache, a user
+  buffer) is never registered with the NIC; a WRITE from it becomes a secure
+  push that completes only after the peer has verified and decrypted it.
+- In the store's Python client, every call that moves object bytes and cannot
+  be authenticated as a whole object: ranged reads/writes, sessions,
+  `get_buffer`, `put_from_with_metadata`, dummy/shm modes, offload. These
+  return `INVALID_PARAMS`. Metadata calls are forwarded.
+- Store RPCs and handshakes without a valid, fresh, unreplayed tag (answered
+  with code 401 / dropped).
+
+Not covered: the master admin HTTP API (metrics, key listing, drain jobs) is
+not authenticated; keep it off untrusted networks.

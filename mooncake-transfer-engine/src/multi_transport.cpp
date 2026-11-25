@@ -21,6 +21,9 @@
 
 #include "config.h"
 #include "multi_transport_locality.h"
+#ifdef WITH_SECURE_KV
+#include "secure/secure_transport.h"
+#endif
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
@@ -733,6 +736,10 @@ Transport* MultiTransport::installTransport(const std::string& proto,
             setenv("ACCL_USE_NICS", nics.c_str(), 1);
         }
     }
+#endif
+#ifdef WITH_SECURE_KV
+    transport = secure::MaybeWrapTransport(proto, transport);
+    if (!transport) return nullptr;
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {
         delete transport;

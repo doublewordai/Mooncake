@@ -525,3 +525,7 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(WITH_SECURE_KV)
+  add_store_test(secure_store_test secure/secure_store_test.cpp)
+endif()

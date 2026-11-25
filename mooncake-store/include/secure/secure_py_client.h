@@ -22,7 +22,8 @@
 //    host memory on the copy engine), and the sealed bytes are what the inner
 //    client stores, on whatever path it picks (local memcpy, RDMA, disk).
 //    Sizes sent to the master are the sealed sizes.
-//  * Get: the sealed object is fetched into staging and every segment is
+//  * Get: the sealed object is fetched into staging (a replica in this
+//    client's own segment is opened where it lies) and every segment is
 //    verified before the caller sees any of it; a failure is a per-key
 //    CHECKSUM_MISMATCH that leaves a host buffer zeroed and GPU memory
 //    untouched.

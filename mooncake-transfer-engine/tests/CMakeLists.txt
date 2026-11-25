@@ -37,6 +37,12 @@ target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
                                                   gtest_main)
 add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
 
+# Hardware-free: the CXI peer link's handshake protocol (simultaneous open).
+add_executable(cxi_peer_link_test ${WORKSPACE}/cxi_peer_link_test.cpp)
+target_link_libraries(cxi_peer_link_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME cxi_peer_link_test COMMAND cxi_peer_link_test)
+
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
                ${WORKSPACE}/flagcx_transport_internal_test.cpp)

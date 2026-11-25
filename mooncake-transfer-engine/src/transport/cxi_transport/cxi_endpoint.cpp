@@ -27,86 +27,97 @@
 
 namespace mooncake {
 
+static_assert(CxiPeerLink::kNoSlot == FI_ADDR_UNSPEC,
+              "CxiPeerLink's empty slot must be libfabric's");
+
 CxiEndpoint::CxiEndpoint(CxiContext& context)
-    : context_(context), status_(INITIALIZING), peer_fi_addr_(FI_ADDR_UNSPEC) {}
+    : context_(context),
+      link_(CxiPeerLink::AddressVector{
+          [&context](const std::string& addr, uint64_t& slot) {
+              fi_addr_t fi_addr = FI_ADDR_UNSPEC;
+              int rc = context.insertPeerAddr(addr, fi_addr);
+              slot = fi_addr;
+              return rc;
+          },
+          [&context](uint64_t slot) { context.removePeerAddr(slot); }}) {}
 
 CxiEndpoint::~CxiEndpoint() { disconnect(); }
 
-void CxiEndpoint::setPeerNicPath(const std::string& peer_nic_path) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (peer_nic_path_ == peer_nic_path) return;  // No change
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
-        LOG(INFO) << "Peer reconnected with new address, re-establishing: "
-                  << peer_nic_path_ << " -> " << peer_nic_path;
-        disconnectUnlocked();
-    }
-    peer_nic_path_ = peer_nic_path;
+std::string CxiEndpoint::peerNicPath() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return peer_nic_path_;
 }
 
-int CxiEndpoint::setupConnectionsByActive() {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
+void CxiEndpoint::setPeerNicPath(const std::string& peer_nic_path) {
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (peer_nic_path_ == peer_nic_path) return;  // No change
+        peer_nic_path_ = peer_nic_path;
+    }
+    if (link_.connected()) {
+        LOG(INFO) << "Peer reconnected with new address, re-establishing: "
+                  << toString();
+        link_.disconnect();
+    }
+}
 
-    // Loopback: handshake against ourselves.  Use the binary overload
-    // so we avoid hex-encoding the local address just to have
-    // insertPeerAddr decode it right back.
-    if (context_.nicPath() == peer_nic_path_) {
-        const auto& bytes = context_.localEpAddrBytes();
-        int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
-                                               peer_fi_addr_);
-        if (ret != 0) return ret;
-        status_.store(CONNECTED, std::memory_order_release);
-        LOG(INFO) << "CXI loopback connection established: " << toString();
-        return 0;
+// The handshake RPC runs without any lock the passive side takes; see
+// CxiPeerLink.
+int CxiEndpoint::setupConnectionsByActive() {
+    if (link_.connected()) return 0;
+    const std::string peer_nic_path = peerNicPath();
+
+    // Loopback: no handshake, the peer is our own endpoint.
+    if (context_.nicPath() == peer_nic_path) {
+        int rc = link_.connect([this](std::string& peer_addr) {
+            peer_addr = context_.localEpAddr();
+            return 0;
+        });
+        if (rc == 0)
+            LOG(INFO) << "CXI loopback connection established: " << toString();
+        return rc;
     }
 
-    // Exchange addresses via the transfer-metadata handshake RPC.
-    TransferMetadata::HandShakeDesc local_desc, peer_desc;
-    local_desc.local_nic_path = context_.nicPath();
-    local_desc.peer_nic_path = peer_nic_path_;
-    local_desc.cxi_addr = context_.localEpAddr();
-
-    auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
-    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
+    auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
+    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
-        LOG(ERROR) << "Parse peer CXI nic path failed: " << peer_nic_path_;
+        LOG(ERROR) << "Parse peer CXI nic path failed: " << peer_nic_path;
         return ERR_INVALID_ARGUMENT;
     }
 
-    int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
-                                             peer_desc);
-    if (rc) return rc;
-
-    if (peer_desc.cxi_addr.empty()) {
-        LOG(ERROR) << "Peer did not provide CXI address in handshake";
-        return ERR_REJECT_HANDSHAKE;
-    }
-
-    rc = context_.insertPeerAddr(peer_desc.cxi_addr, peer_fi_addr_);
-    if (rc != 0) return rc;
-
-    status_.store(CONNECTED, std::memory_order_release);
-    VLOG(1) << "CXI connection established: " << toString()
-            << " peer_fi_addr=" << peer_fi_addr_;
-    return 0;
+    int rc = link_.connect([&](std::string& peer_addr) {
+        // Exchange addresses via the transfer-metadata handshake RPC.
+        TransferMetadata::HandShakeDesc local_desc, peer_desc;
+        local_desc.local_nic_path = context_.nicPath();
+        local_desc.peer_nic_path = peer_nic_path;
+        local_desc.cxi_addr = context_.localEpAddr();
+        int ret = context_.engine().sendHandshake(peer_server_name,
+                                                  local_desc, peer_desc);
+        if (ret) return ret;
+        if (peer_desc.cxi_addr.empty()) {
+            LOG(ERROR) << "Peer did not provide CXI address in handshake";
+            return static_cast<int>(ERR_REJECT_HANDSHAKE);
+        }
+        peer_addr = peer_desc.cxi_addr;
+        return 0;
+    });
+    if (rc == 0)
+        VLOG(1) << "CXI connection established: " << toString()
+                << " peer_fi_addr=" << link_.slot();
+    return rc;
 }
 
 int CxiEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                            HandShakeDesc& local_desc) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) {
-        LOG(WARNING) << "Re-establish CXI connection: " << toString();
-        disconnectUnlocked();
-    }
-
+    const std::string peer_nic_path = peerNicPath();
     if (peer_desc.peer_nic_path != context_.nicPath() ||
-        peer_desc.local_nic_path != peer_nic_path_) {
+        peer_desc.local_nic_path != peer_nic_path) {
         local_desc.reply_msg = "CXI nic path inconsistency";
         LOG(ERROR) << "Invalid argument: peer CXI nic path inconsistency"
                    << " peer_nic_path=" << peer_desc.peer_nic_path
                    << " context_.nicPath()=" << context_.nicPath()
                    << " local_nic_path=" << peer_desc.local_nic_path
-                   << " peer_nic_path_=" << peer_nic_path_;
+                   << " peer_nic_path_=" << peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -116,49 +127,35 @@ int CxiEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
-    int ret = context_.insertPeerAddr(peer_desc.cxi_addr, peer_fi_addr_);
+    // Idempotent for an unchanged peer address: a peer's handshake that
+    // crosses ours, or repeats after a timeout, keeps the slot in place.
+    int ret = link_.accept(peer_desc.cxi_addr);
     if (ret != 0) {
         local_desc.reply_msg = "Failed to insert peer address";
         return ret;
     }
 
     local_desc.local_nic_path = context_.nicPath();
-    local_desc.peer_nic_path = peer_nic_path_;
+    local_desc.peer_nic_path = peer_nic_path;
     local_desc.cxi_addr = context_.localEpAddr();
     // reply_msg empty on success
 
-    status_.store(CONNECTED, std::memory_order_release);
     VLOG(1) << "CXI connection established (passive): " << toString();
     return 0;
 }
 
 const std::string CxiEndpoint::toString() const {
-    return "CxiEndpoint[" + context_.nicPath() + " <-> " + peer_nic_path_ + "]";
+    return "CxiEndpoint[" + context_.nicPath() + " <-> " + peerNicPath() + "]";
 }
 
-void CxiEndpoint::disconnect() {
-    RWSpinlock::WriteGuard guard(lock_);
-    disconnectUnlocked();
-}
+void CxiEndpoint::disconnect() { link_.disconnect(); }
 
-void CxiEndpoint::disconnectUnlocked() {
-    if (peer_fi_addr_ != FI_ADDR_UNSPEC) {
-        context_.removePeerAddr(peer_fi_addr_);
-        peer_fi_addr_ = FI_ADDR_UNSPEC;
-    }
-    status_.store(UNCONNECTED, std::memory_order_release);
-}
-
-void CxiEndpoint::markDetachedForTeardown() {
-    RWSpinlock::WriteGuard guard(lock_);
-    peer_fi_addr_ = FI_ADDR_UNSPEC;
-    status_.store(UNCONNECTED, std::memory_order_release);
-}
+void CxiEndpoint::markDetachedForTeardown() { link_.forget(); }
 
 int CxiEndpoint::submitPostSend(
     std::vector<Transport::Slice*>& slice_list,
     std::vector<Transport::Slice*>& failed_slice_list) {
-    if (status_.load(std::memory_order_relaxed) != CONNECTED) {
+    if (!link_.connected()) {
         int ret = setupConnectionsByActive();
         if (ret != 0) {
             for (auto* slice : slice_list) {
@@ -169,11 +166,7 @@ int CxiEndpoint::submitPostSend(
         }
     }
 
-    fi_addr_t peer;
-    {
-        RWSpinlock::ReadGuard guard(lock_);
-        peer = peer_fi_addr_;
-    }
+    const fi_addr_t peer = link_.slot();
     if (peer == FI_ADDR_UNSPEC) {
         for (auto* slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();

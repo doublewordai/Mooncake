@@ -30,6 +30,7 @@
 
 #include "common.h"
 #include "cxi_context.h"
+#include "cxi_peer_link.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -63,8 +64,6 @@ class CxiEndpoint {
    public:
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
-    enum Status { INITIALIZING, UNCONNECTED, CONNECTED };
-
     explicit CxiEndpoint(CxiContext& context);
     ~CxiEndpoint();
 
@@ -86,9 +85,7 @@ class CxiEndpoint {
     // API compatibility with callers that still ask.
     bool hasOutstandingSlice() const { return false; }
 
-    bool connected() const {
-        return status_.load(std::memory_order_relaxed) == CONNECTED;
-    }
+    bool connected() const { return link_.connected(); }
 
     void disconnect();
 
@@ -97,9 +94,6 @@ class CxiEndpoint {
     // every slot in one shot; calling fi_av_remove after the shared endpoint
     // has been closed trips an assertion inside the CXI provider.
     void markDetachedForTeardown();
-
-   private:
-    void disconnectUnlocked();
 
    public:
     const std::string toString() const;
@@ -114,17 +108,19 @@ class CxiEndpoint {
     // sum "QP count" across endpoints don't break.
     size_t getQPNumber() const { return 1; }
 
-    fi_addr_t getPeerFiAddr() const { return peer_fi_addr_; }
+    fi_addr_t getPeerFiAddr() const { return link_.slot(); }
 
     CxiContext& context() { return context_; }
 
    private:
-    CxiContext& context_;
-    std::atomic<Status> status_;
+    std::string peerNicPath() const;
 
-    RWSpinlock lock_;  // protects peer_nic_path_ and status_
+    CxiContext& context_;
+
+    mutable RWSpinlock lock_;  // protects peer_nic_path_; never held across
+                               // the handshake RPC
     std::string peer_nic_path_;
-    fi_addr_t peer_fi_addr_;  // slot in context_.av()
+    CxiPeerLink link_;  // the peer's address and its slot in context_.av()
 };
 
 }  // namespace mooncake

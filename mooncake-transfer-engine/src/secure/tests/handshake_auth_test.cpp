@@ -171,6 +171,49 @@ TEST_F(HandshakeAuthTest, NoKeyFailsClosedBothWays) {
     EXPECT_EQ(ReadFrom(wire).first, HandShakeRequestType::Invalid);
 }
 
+// The secure push's control endpoint is learned only from a descriptor that
+// arrived in an authenticated Metadata message, never from fabric memory and
+// never from a message without a valid tag.
+TEST_F(HandshakeAuthTest, P2dEndpointTravelsOnlyInAuthenticatedMetadata) {
+    // Names unique to this run: learned endpoints outlive a test.
+    static int run = 0;
+    ++run;
+    const std::string name = "10.0.0.1:" + std::to_string(1000 + run);
+    AdvertiseP2dEndpoint(name, "10.0.0.1", 18555);
+    auto wire =
+        Frame(HandShakeRequestType::Metadata, "{\"name\":\"" + name + "\"}");
+    // Another descriptor, or another message type, carries nothing.
+    auto other = Frame(HandShakeRequestType::Metadata, "{\"name\":\"x:1\"}");
+    auto probe =
+        Frame(HandShakeRequestType::Probe, "{\"name\":\"" + name + "\"}");
+    WithdrawP2dEndpoint(name);
+    std::string host;
+    int port = 0;
+    EXPECT_FALSE(LookupP2dEndpoint(name, &host, &port));
+    EXPECT_EQ(ReadFrom(other).second.find("mc_secure_p2d"), std::string::npos);
+    EXPECT_EQ(ReadFrom(probe).second.find("mc_secure_p2d"), std::string::npos);
+    EXPECT_FALSE(LookupP2dEndpoint(name, &host, &port));
+    auto [type, body] = ReadFrom(wire);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    ASSERT_TRUE(LookupP2dEndpoint(name, &host, &port));
+    EXPECT_EQ(host, "10.0.0.1");
+    EXPECT_EQ(port, 18555);
+
+    // Refused: an endpoint in an untagged message or one tagged under
+    // another key is never recorded.
+    const std::string forged_name = "10.0.0.2:" + std::to_string(1000 + run);
+    const std::string forged = "{\"name\":\"" + forged_name +
+                               "\",\"mc_secure_p2d\":{\"host\":\"6.6.6.6\","
+                               "\"port\":1}}";
+    EXPECT_EQ(ReadFrom(PlainFrame(HandShakeRequestType::Metadata, forged)).first,
+              HandShakeRequestType::Invalid);
+    ca::ConfigureForTesting(true, kSecretB);
+    auto wrong_key = Frame(HandShakeRequestType::Metadata, forged);
+    ca::ConfigureForTesting(true, kSecretA);
+    EXPECT_EQ(ReadFrom(wrong_key).first, HandShakeRequestType::Invalid);
+    EXPECT_FALSE(LookupP2dEndpoint(forged_name, &host, &port));
+}
+
 TEST_F(HandshakeAuthTest, SecureModeRefusesMetadataStores) {
     EXPECT_DEATH(OnTransferMetadataCreated("etcd://127.0.0.1:2379"),
                  "P2PHANDSHAKE");

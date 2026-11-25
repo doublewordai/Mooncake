@@ -28,6 +28,10 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 #include "types.h"
+
+#ifdef MOONCAKE_WITH_SECURE_KV
+#include "rpc_auth.h"
+#endif
 #include "version.h"
 
 namespace mooncake {
@@ -265,7 +269,13 @@ MasterAdminServer::MasterAdminServer(uint16_t http_port,
                                      bool enable_metric_reporting,
                                      std::string http_host)
     : http_port_(http_port),
+#ifdef MOONCAKE_WITH_SECURE_KV
+      // Loopback-only in secure mode (rpc_auth.h); decided once, here, for
+      // the master, the HA supervisor and the embedded master alike.
+      http_host_(secure::AdminBindHost(http_host)),
+#else
       http_host_(std::move(http_host)),
+#endif
       enable_metric_reporting_(enable_metric_reporting),
       http_server_(4, http_port, http_host_) {}
 

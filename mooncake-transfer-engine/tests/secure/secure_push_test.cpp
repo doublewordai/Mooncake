@@ -4,13 +4,20 @@
 // authenticated control channel and reported complete only after the peer
 // has verified and decrypted it.
 
+#include <arpa/inet.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -22,6 +29,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "control_auth.h"
+#include "handshake_auth.h"
 #include "secure/kv_crypto.h"
 #include "secure/secure_push.h"
 #include "secure/secure_transport.h"
@@ -77,6 +86,10 @@ class SecurePushTest : public ::testing::Test {
             SecureContext::CreateForTesting(cfg, nullptr));
         ASSERT_TRUE(SecureContext::Global().enabled());
         ASSERT_FALSE(SecureContext::Global().failed());
+        // Both halves, as MC_SECURE_MODE switches them on: the handshake hook
+        // (installed as each engine's metadata is created) carries the push
+        // endpoints.
+        control_auth::ConfigureForTesting(true, std::string(40, 'h'));
         nodes_ = new std::vector<Node>(3);
         for (int i = 0; i < 3; ++i) {
             auto& n = (*nodes_)[i];
@@ -96,6 +109,8 @@ class SecurePushTest : public ::testing::Test {
     static void TearDownTestSuite() {
         delete nodes_;
         nodes_ = nullptr;
+        UninstallHandshakeAuthForTesting();
+        control_auth::ResetForTesting();
         SecureContext::ResetForTesting(nullptr);
     }
 
@@ -149,6 +164,8 @@ class SecurePushTest : public ::testing::Test {
         return s.ok() ? st.s : Transport::TransferStatusEnum::FAILED;
     }
 
+    static void FloodThenPush(Node& sender, Node& receiver, int addresses);
+
     static std::vector<Node>* nodes_;
 };
 
@@ -194,6 +211,99 @@ std::vector<Piece> Scatter(uint8_t* src, uint8_t* dst, size_t size,
         doff += len;
     }
     return pieces;
+}
+
+// A TCP connection to host:port from the local address `src`, or -1.
+int ConnectFrom(const std::string& src, const std::string& host, int port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    if (inet_pton(AF_INET, src.c_str(), &a.sin_addr) != 1 ||
+        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    sockaddr_in d{};
+    d.sin_family = AF_INET;
+    d.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &d.sin_addr) != 1 ||
+        ::connect(fd, reinterpret_cast<sockaddr*>(&d), sizeof(d)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+bool RaiseFdLimit(rlim_t want) {
+    rlimit rl{};
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return false;
+    if (rl.rlim_cur >= want) return true;
+    if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < want) return false;
+    rl.rlim_cur = want;
+    return setrlimit(RLIMIT_NOFILE, &rl) == 0;
+}
+
+bool WaitFor(const std::function<bool()>& pred, int timeout_ms) {
+    auto until = std::chrono::steady_clock::now() +
+                 std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < until) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
+// True while the peer has neither closed nor sent anything.
+bool StillOpen(int fd) {
+    pollfd p{fd, POLLIN, 0};
+    return ::poll(&p, 1, 0) == 0;
+}
+
+// Milliseconds until the peer closed `fd` (EOF or reset), or -1 if it is
+// still open after timeout_ms. Discards anything the peer sends.
+int MsUntilClosed(int fd, int timeout_ms) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        if (el >= timeout_ms) return -1;
+        pollfd p{fd, POLLIN, 0};
+        int r = ::poll(&p, 1, static_cast<int>(timeout_ms - el));
+        if (r <= 0) continue;
+        char buf[4096];
+        ssize_t k = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (k == 0 || (k < 0 && errno != EAGAIN && errno != EINTR))
+            return static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+    }
+}
+
+// A sealed HELLO for `receiver`, framed as on the wire.
+std::string HelloFrame(const std::string& receiver) {
+    std::string body(1, '\x03');
+    const std::string sender = "test-sender";
+    uint32_t n = static_cast<uint32_t>(sender.size());
+    for (int i = 0; i < 4; ++i) body.push_back(static_cast<char>(n >> (8 * i)));
+    body += sender;
+    const std::string aad = RequestAad(receiver);
+    std::string sealed(SealedSize(body.size()), '\0');
+    ConstSpan pt{body.data(), body.size()};
+    EXPECT_EQ(SecureContext::Global()
+                  .sealer(Purpose::kControl)
+                  .Seal(&pt, 1, {aad.data(), aad.size()},
+                        {sealed.data(), sealed.size()}, nullptr),
+              Error::kOk);
+    uint32_t len = htonl(static_cast<uint32_t>(sealed.size()));
+    return std::string(reinterpret_cast<const char*>(&len), 4) + sealed;
+}
+
+bool SendRaw(int fd, const std::string& bytes) {
+    return ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(bytes.size());
 }
 
 void ExpectDelivered(const std::vector<Piece>& pieces) {
@@ -582,6 +692,201 @@ TEST_F(SecurePushTest, DeviceMemoryRoundTrip) {
     cudaFree(ddst);
 }
 #endif
+
+// Discovery reads nothing a fabric peer can write: with every buffer the
+// receiver publishes overwritten (the reported attack wrote 4 KiB of junk at
+// offset 0 of the receive staging), a sender that has never pushed to it
+// still finds it and pushes.
+TEST_F(SecurePushTest, OverwrittenStagingDoesNotBreakDiscovery) {
+    Buf src(C(), 1 << 16, 0x5A);
+    Buf dst(B(), 1 << 16, 0);
+    auto seg = Open(C(), B());
+    ASSERT_TRUE(B().xport->push_service()->receiver_enabled());
+    auto desc = C().engine->getMetadata()->getSegmentDescByID(seg, true);
+    ASSERT_TRUE(desc);
+    ASSERT_FALSE(desc->buffers.empty());
+    for (auto& b : desc->buffers)
+        memset(reinterpret_cast<void*>(b.addr), 0xCC, b.length);
+    C().xport->push_service()->ForgetPeersForTesting();
+    EXPECT_EQ(Transfer(C(), seg, {{src.data(), dst.data(), src.size()}}),
+              Transport::TransferStatusEnum::COMPLETED);
+    for (size_t i = 0; i < dst.size(); ++i) ASSERT_EQ(dst.data()[i], 0x5A) << i;
+}
+
+// 1100 idle unauthenticated connections (the reported lock-out used 1100
+// against a 1024 cap) from `addresses` source addresses; then a sender with
+// no pooled connection still connects and pushes.
+void SecurePushTest::FloodThenPush(Node& sender, Node& receiver,
+                                   int addresses) {
+    constexpr int kFlood = 1100;
+    if (!RaiseFdLimit(kFlood + 2048)) GTEST_SKIP() << "RLIMIT_NOFILE too low";
+    const auto opt = PushOptions::FromEnv();
+    Buf src(sender, 1 << 16, 0x6B);
+    Buf dst(receiver, 1 << 16, 0);
+    auto seg = sender.engine->openSegment(receiver.engine->getLocalIpAndPort());
+    ASSERT_NE(seg, (Transport::SegmentHandle)-1);
+    auto* rx = receiver.xport->push_service();
+    ASSERT_TRUE(rx->receiver_enabled());
+    const auto before = rx->control_stats();
+    std::vector<int> flood;
+    for (int i = 0; i < kFlood; ++i) {
+        const int a = i % addresses;
+        const std::string from = "127.0." + std::to_string(1 + a / 250) + "." +
+                                 std::to_string(2 + a % 250);
+        int fd = ConnectFrom(from, rx->control_host(), rx->control_port());
+        if (fd < 0 && i == 0) GTEST_SKIP() << "cannot connect from " << from;
+        ASSERT_GE(fd, 0) << "connection " << i << " from " << from;
+        flood.push_back(fd);
+    }
+    // The server has taken every one (admitted or displaced).
+    EXPECT_TRUE(WaitFor(
+        [&] {
+            auto st = rx->control_stats();
+            return st.evicted_conns - before.evicted_conns + st.preauth_conns >=
+                   static_cast<uint64_t>(kFlood);
+        },
+        30000));
+    auto st = rx->control_stats();
+    EXPECT_LE(st.preauth_conns, opt.max_preauth);
+    if (addresses == 1) EXPECT_LE(st.preauth_conns, opt.max_preauth_per_ip);
+
+    sender.xport->push_service()->ForgetPeersForTesting();
+    EXPECT_EQ(Transfer(sender, seg, {{src.data(), dst.data(), src.size()}}),
+              Transport::TransferStatusEnum::COMPLETED);
+    for (size_t i = 0; i < dst.size(); ++i) ASSERT_EQ(dst.data()[i], 0x6B) << i;
+    for (int fd : flood) ::close(fd);
+}
+
+TEST_F(SecurePushTest, UnauthenticatedFloodFromOneAddressDoesNotLockOut) {
+    FloodThenPush(A(), B(), 1);
+}
+
+TEST_F(SecurePushTest, UnauthenticatedFloodFromManyAddressesDoesNotLockOut) {
+    // 8 per address: under the per-address cap, so only the total cap and
+    // its eviction stand between the flood and the sender.
+    FloodThenPush(C(), B(), 138);
+}
+
+// An unauthenticated connection's length claim over the cap is refused
+// before anything is allocated for it; one at the cap is read and refused
+// as unauthenticated.
+TEST_F(SecurePushTest, OversizedUnauthenticatedFrameIsNotAllocated) {
+    Buf dst(B(), 1 << 16, 0);
+    auto* rx = B().xport->push_service();
+    ASSERT_TRUE(rx->receiver_enabled());
+    const auto opt = PushOptions::FromEnv();
+    const auto before = rx->control_stats();
+    const auto rejected = rx->rejected_requests();
+    constexpr int kClaims = 32;
+    std::vector<int> fds;
+    for (int i = 0; i < kClaims; ++i) {
+        int fd = ConnectFrom("127.0.0.1", rx->control_host(), rx->control_port());
+        ASSERT_GE(fd, 0);
+        uint32_t len = htonl(60u << 20);
+        ASSERT_TRUE(SendRaw(fd, std::string(reinterpret_cast<char*>(&len), 4) +
+                                    std::string(4096, 'z')));
+        fds.push_back(fd);
+    }
+    for (int fd : fds) {
+        EXPECT_GE(MsUntilClosed(fd, 3000), 0);
+        ::close(fd);
+    }
+    auto st = rx->control_stats();
+    EXPECT_EQ(st.oversized_frames - before.oversized_frames,
+              static_cast<uint64_t>(kClaims));
+    EXPECT_LE(st.preauth_buffer_peak,
+              opt.max_preauth * kMaxUnauthenticatedFrameBytes);
+
+    // At the cap: read, then refused as unauthenticated, not as oversized.
+    // One byte over: refused unread.
+    for (size_t n : {kMaxUnauthenticatedFrameBytes,
+                     kMaxUnauthenticatedFrameBytes + 1}) {
+        int fd = ConnectFrom("127.0.0.1", rx->control_host(), rx->control_port());
+        ASSERT_GE(fd, 0);
+        uint32_t len = htonl(static_cast<uint32_t>(n));
+        SendRaw(fd, std::string(reinterpret_cast<char*>(&len), 4) +
+                        std::string(n, 'y'));
+        EXPECT_GE(MsUntilClosed(fd, 3000), 0);
+        ::close(fd);
+    }
+    st = rx->control_stats();
+    EXPECT_EQ(st.oversized_frames - before.oversized_frames,
+              static_cast<uint64_t>(kClaims + 1));
+    EXPECT_EQ(rx->rejected_requests() - rejected,
+              static_cast<uint64_t>(kClaims + 2));
+}
+
+// A connection that never authenticates (silent, or trickling a frame) is
+// closed after the handshake timeout; an authenticated one outlives it and is
+// closed after the idle timeout.
+TEST_F(SecurePushTest, UnauthenticatedAndIdleConnectionsAreClosed) {
+    PushOptions o;
+    o.threads = 1;
+    o.segment_bytes = 65536;
+    o.rx_bytes = 1 << 20;
+    o.handshake_timeout_ms = 300;
+    o.idle_timeout_ms = 1500;
+    PushFabric f;
+    f.register_ciphertext = [](void*, size_t) { return 0; };
+    f.unregister = [](void*) { return 0; };
+    f.is_local_only = [](const void*, size_t) { return false; };
+    f.local_name = "127.0.0.1:1";
+    SecurePushService svc(f, o);
+    ASSERT_EQ(svc.EnableReceiver(), 0);
+    const std::string host = svc.control_host();
+    const int port = svc.control_port();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int silent = ConnectFrom("127.0.0.1", host, port);
+    int slow = ConnectFrom("127.0.0.1", host, port);
+    int authed = ConnectFrom("127.0.0.1", host, port);
+    ASSERT_GE(silent, 0);
+    ASSERT_GE(slow, 0);
+    ASSERT_GE(authed, 0);
+    // A 200-byte frame, a byte every 50 ms: 10 s if it were let finish.
+    uint32_t len = htonl(200);
+    ASSERT_TRUE(SendRaw(slow, std::string(reinterpret_cast<char*>(&len), 4)));
+    std::atomic<bool> trickling{true};
+    std::thread trickle([&] {
+        for (int i = 0; i < 200 && trickling.load(); ++i) {
+            if (!SendRaw(slow, "x")) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    // HELLO authenticates; the reply comes back.
+    ASSERT_TRUE(SendRaw(authed, HelloFrame(f.local_name)));
+    uint32_t rlen = 0;
+    ASSERT_EQ(::recv(authed, &rlen, 4, MSG_WAITALL), 4);
+    std::string reply(ntohl(rlen), '\0');
+    ASSERT_EQ(::recv(authed, reply.data(), reply.size(), MSG_WAITALL),
+              static_cast<ssize_t>(reply.size()));
+    EXPECT_TRUE(WaitFor([&] { return svc.control_stats().auth_conns == 1; },
+                        1000));
+
+    EXPECT_GE(MsUntilClosed(silent, 3000), 0);
+    EXPECT_GE(MsUntilClosed(slow, 3000), 0);
+    trickling.store(false);
+    trickle.join();
+    const auto unauth_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    EXPECT_GE(unauth_ms, 250);
+    EXPECT_LT(unauth_ms, 3000);
+    // Past the handshake timeout, the authenticated connection is still up.
+    std::this_thread::sleep_until(t0 + std::chrono::milliseconds(800));
+    EXPECT_TRUE(StillOpen(authed));
+    EXPECT_GE(MsUntilClosed(authed, 5000), 0);
+    EXPECT_GE(svc.control_stats().timed_out_conns, 3u);
+    EXPECT_TRUE(WaitFor(
+        [&] {
+            auto st = svc.control_stats();
+            return st.preauth_conns + st.auth_conns == 0;
+        },
+        2000));
+    ::close(silent);
+    ::close(slow);
+    ::close(authed);
+}
 
 TEST(SecurePushOptions, CpuList) {
     std::vector<int> c;

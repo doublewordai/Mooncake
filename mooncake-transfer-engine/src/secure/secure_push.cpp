@@ -16,6 +16,8 @@
 
 #include "secure/device_copy.h"
 
+#include "handshake_auth.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glog/logging.h>
@@ -38,6 +40,7 @@
 #include <cstring>
 #include <deque>
 #include <list>
+#include <unordered_map>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -50,15 +53,16 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr size_t kBeaconBytes = 4096;
-constexpr uint32_t kBeaconVersion = 1;
+constexpr uint32_t kHelloVersion = 1;
 constexpr size_t kMaxFrame = 64ull << 20;
 constexpr uint32_t kMaxPiecesPerSegment = 1u << 20;
 
 constexpr uint8_t kReqReserve = 1;
 constexpr uint8_t kReqCommit = 2;
+constexpr uint8_t kReqHello = 3;
 constexpr uint8_t kRespReserve = 0x81;
 constexpr uint8_t kRespCommit = 0x82;
+constexpr uint8_t kRespHello = 0x83;
 constexpr uint8_t kCommitLast = 1;
 
 constexpr int32_t kOk = 0;
@@ -69,7 +73,6 @@ constexpr int32_t kErrLease = 4;
 
 const char kAadReq[] = "mcp2d-req-v1";
 const char kAadResp[] = "mcp2d-resp-v1";
-const char kAadBeacon[] = "mcp2d-beacon-v1";
 const char kAadData[] = "mcp2d-data-v1";
 
 size_t EnvSize(const char* name, size_t def) {
@@ -260,6 +263,52 @@ bool RecvFrame(int fd, std::string* frame) {
     return RecvAll(fd, frame->data(), len);
 }
 
+enum class Rx { kOk, kClosed, kTimeout, kTooLarge };
+
+// Reads exactly n bytes by `deadline`, however slowly the peer trickles them.
+Rx RecvBy(int fd, void* p, size_t n, Clock::time_point deadline) {
+    auto* c = static_cast<char*>(p);
+    while (n) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - Clock::now())
+                              .count();
+        if (left <= 0) return Rx::kTimeout;
+        pollfd pf{fd, POLLIN, 0};
+        int r = ::poll(&pf, 1, static_cast<int>(std::min<int64_t>(left, 1000)));
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return Rx::kClosed;
+        if (r == 0) continue;
+        ssize_t k = ::recv(fd, c, n, MSG_DONTWAIT);
+        if (k < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (k <= 0) return Rx::kClosed;
+        c += k;
+        n -= static_cast<size_t>(k);
+    }
+    return Rx::kOk;
+}
+
+// Server side: one frame whose length prefix must arrive by
+// `header_deadline` and whose body by `body_deadline`. A length over
+// `max_len` is refused before anything is allocated for it. `on_alloc` is
+// told the body size before the buffer grows and after the frame is read
+// (or not).
+Rx RecvFrameBy(int fd, std::string* frame, size_t max_len,
+               Clock::time_point header_deadline,
+               Clock::time_point body_deadline,
+               const std::function<void(size_t)>& on_alloc,
+               uint32_t* claimed = nullptr) {
+    uint32_t len;
+    Rx r = RecvBy(fd, &len, 4, header_deadline);
+    if (r != Rx::kOk) return r;
+    len = ntohl(len);
+    if (claimed) *claimed = len;
+    if (len > max_len) return Rx::kTooLarge;
+    if (on_alloc) on_alloc(len);
+    frame->resize(len);
+    return RecvBy(fd, frame->data(), len, body_deadline);
+}
+
 void SetTimeouts(int fd, int timeout_ms) {
     timeval tv{};
     tv.tv_sec = timeout_ms / 1000;
@@ -413,6 +462,18 @@ PushOptions PushOptions::FromEnv() {
     o.timeout_ms = static_cast<int>(
         std::max<size_t>(100, EnvSize("MC_SECURE_P2D_TIMEOUT_MS", 30000)));
     o.rx_copy = EnvSize("MC_SECURE_P2D_RX_COPY", 1) != 0;
+    o.max_conns =
+        std::max<size_t>(1, EnvSize("MC_SECURE_P2D_MAX_CONNS", o.max_conns));
+    o.max_preauth = std::max<size_t>(
+        1, EnvSize("MC_SECURE_P2D_MAX_PREAUTH", o.max_preauth));
+    o.max_preauth_per_ip = std::max<size_t>(
+        1, EnvSize("MC_SECURE_P2D_MAX_PREAUTH_PER_IP", o.max_preauth_per_ip));
+    o.handshake_timeout_ms = static_cast<int>(std::min<size_t>(
+        600000, std::max<size_t>(100, EnvSize("MC_SECURE_P2D_HANDSHAKE_TIMEOUT_MS",
+                                              o.handshake_timeout_ms))));
+    o.idle_timeout_ms = static_cast<int>(std::min<size_t>(
+        86400000, std::max<size_t>(100, EnvSize("MC_SECURE_P2D_IDLE_TIMEOUT_MS",
+                                                o.idle_timeout_ms))));
     if (const char* h = getenv("MC_SECURE_P2D_HOST")) o.host = h;
     if (const char* c = getenv("MC_SECURE_P2D_CPUS")) {
         if (!ParseCpuList(c, &o.cpus)) {
@@ -491,16 +552,27 @@ struct SecurePushService::Receiver {
     std::mutex slots_mu;
     std::vector<uint64_t> slot_lease;  // 0: free
 
+    // A control connection. `fd` is closed only by its owner (the reaper or
+    // Stop, under conns_mu, after joining), so shutting a live one down
+    // never hits a reused descriptor.
     struct Conn {
-        int fd;
+        int fd = -1;
+        std::string ip;
+        Clock::time_point accepted;
         std::thread thread;
         std::atomic<bool> done{false};
+        std::atomic<bool> authed{false};
+        std::atomic<bool> evicted{false};
     };
     std::mutex conns_mu;
     std::list<std::unique_ptr<Conn>> conns;
 
+    // Accounting (ControlStats).
+    std::atomic<uint64_t> refused{0}, evicted{0}, timed_out{0}, oversized{0};
+    std::atomic<size_t> preauth_buffered{0}, preauth_peak{0};
+
     uint8_t* slot_ptr(uint32_t s) const {
-        return static_cast<uint8_t*>(base) + kBeaconBytes + size_t(s) * slot_bytes;
+        return static_cast<uint8_t*>(base) + size_t(s) * slot_bytes;
     }
 
     ~Receiver() { Stop(); }
@@ -519,8 +591,29 @@ struct SecurePushService::Receiver {
         }
         for (auto& c : all) {
             if (c->thread.joinable()) c->thread.join();
+            ::close(c->fd);
         }
         open_pool.reset();
+    }
+
+    ControlStats Stats() {
+        ControlStats st;
+        {
+            std::lock_guard<std::mutex> lock(conns_mu);
+            for (auto& c : conns) {
+                if (c->done.load()) continue;
+                if (c->authed.load())
+                    ++st.auth_conns;
+                else if (!c->evicted.load())
+                    ++st.preauth_conns;
+            }
+        }
+        st.refused_conns = refused.load();
+        st.evicted_conns = evicted.load();
+        st.timed_out_conns = timed_out.load();
+        st.oversized_frames = oversized.load();
+        st.preauth_buffer_peak = preauth_peak.load();
+        return st;
     }
 
     std::vector<uint32_t> Lease(uint64_t lease_id, uint32_t want) {
@@ -544,42 +637,131 @@ struct SecurePushService::Receiver {
             if (l == lease_id) l = 0;
     }
 
+    // conns_mu held.
+    void Reap() {
+        for (auto it = conns.begin(); it != conns.end();) {
+            if ((*it)->done.load()) {
+                (*it)->thread.join();
+                ::close((*it)->fd);
+                it = conns.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // conns_mu held. Makes room for one more unauthenticated connection from
+    // `ip`: if that address is at its cap, drops its oldest; else if all
+    // unauthenticated connections are taken, drops the oldest of the address
+    // holding the most. The newcomer is always admitted, so a flood only
+    // ever displaces itself or the largest flooder, and a sender that
+    // authenticates within a round trip is not kept out.
+    void MakeRoom(const std::string& ip) {
+        const auto& o = svc->opt_;
+        std::unordered_map<std::string, std::pair<size_t, Conn*>> by_ip;
+        size_t total = 0;
+        for (auto& c : conns) {
+            if (c->done.load() || c->authed.load() || c->evicted.load())
+                continue;
+            ++total;
+            auto& e = by_ip[c->ip];
+            ++e.first;
+            if (!e.second || c->accepted < e.second->accepted)
+                e.second = c.get();
+        }
+        Conn* victim = nullptr;
+        auto mine = by_ip.find(ip);
+        if (mine != by_ip.end() &&
+            mine->second.first >= std::max<size_t>(1, o.max_preauth_per_ip)) {
+            victim = mine->second.second;
+        } else if (total >= std::max<size_t>(1, o.max_preauth)) {
+            size_t most = 0;
+            for (auto& kv : by_ip)
+                if (kv.second.first > most) {
+                    most = kv.second.first;
+                    victim = kv.second.second;
+                }
+        }
+        if (victim) {
+            victim->evicted.store(true);
+            ::shutdown(victim->fd, SHUT_RDWR);
+            if (evicted.fetch_add(1) % 1000 == 0)
+                LOG(WARNING) << "secure push: dropping unauthenticated control "
+                                "connections to admit new ones (from "
+                             << victim->ip << "; " << evicted.load()
+                             << " so far)";
+        }
+    }
+
     void AcceptLoop() {
         while (!stop.load()) {
-            int fd = ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+            pollfd pf{listen_fd, POLLIN, 0};
+            int pr = ::poll(&pf, 1, 500);
+            if (stop.load()) return;
+            if (pr <= 0) {
+                std::lock_guard<std::mutex> lock(conns_mu);
+                Reap();
+                continue;
+            }
+            sockaddr_storage ss{};
+            socklen_t sl = sizeof(ss);
+            int fd = ::accept4(listen_fd, reinterpret_cast<sockaddr*>(&ss), &sl,
+                               SOCK_CLOEXEC);
             if (fd < 0) {
                 if (stop.load()) return;
-                if (errno == EINTR || errno == ECONNABORTED) continue;
+                if (errno == EINTR || errno == ECONNABORTED || errno == EAGAIN)
+                    continue;
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            // Replies go only to authenticated peers; never block on one
+            // that stops reading for longer than a step.
+            timeval tv{};
+            tv.tv_sec = svc->opt_.timeout_ms / 1000;
+            tv.tv_usec = (svc->opt_.timeout_ms % 1000) * 1000;
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            char ip[INET6_ADDRSTRLEN] = "?";
+            if (ss.ss_family == AF_INET6)
+                inet_ntop(AF_INET6,
+                          &reinterpret_cast<sockaddr_in6*>(&ss)->sin6_addr, ip,
+                          sizeof(ip));
+            else if (ss.ss_family == AF_INET)
+                inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(&ss)->sin_addr,
+                          ip, sizeof(ip));
             std::lock_guard<std::mutex> lock(conns_mu);
-            // Reap finished connections.
-            for (auto it = conns.begin(); it != conns.end();) {
-                if ((*it)->done.load()) {
-                    (*it)->thread.join();
-                    it = conns.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            if (conns.size() >= 1024) {
-                LOG(WARNING) << "secure push: too many control connections";
-                ::close(fd);
-                continue;
-            }
+            Reap();
+            MakeRoom(ip);
             auto c = std::make_unique<Conn>();
             c->fd = fd;
+            c->ip = ip;
+            c->accepted = Clock::now();
             Conn* raw = c.get();
             c->thread = std::thread([this, raw] {
-                Serve(raw->fd);
-                ::close(raw->fd);
+                Serve(raw);
                 raw->done.store(true);
             });
             conns.push_back(std::move(c));
         }
+    }
+
+    // Marks `c` authenticated unless that would exceed MC_SECURE_P2D_MAX_CONNS.
+    bool Authenticate(Conn* c) {
+        std::lock_guard<std::mutex> lock(conns_mu);
+        if (c->evicted.load()) return false;
+        size_t n = 0;
+        for (auto& o : conns)
+            if (!o->done.load() && o->authed.load()) ++n;
+        if (n >= svc->opt_.max_conns) {
+            if (refused.fetch_add(1) % 1000 == 0)
+                LOG(WARNING) << "secure push: too many authenticated control "
+                                "connections ("
+                             << n << ")";
+            return false;
+        }
+        c->authed.store(true);
+        return true;
     }
 
     bool Reply(int fd, const std::string& req_header, const std::string& body) {
@@ -591,26 +773,77 @@ struct SecurePushService::Receiver {
         return SendFrame(fd, frame);
     }
 
-    void Serve(int fd) {
+    void Serve(Conn* c) {
+        const int fd = c->fd;
+        const auto& o = svc->opt_;
         uint64_t lease_id = 0;
         std::string frame, body;
         const std::string req_aad = Aad(kAadReq, svc->fabric_.local_name);
+        const auto handshake_deadline =
+            c->accepted + std::chrono::milliseconds(o.handshake_timeout_ms);
         while (!stop.load()) {
-            if (!RecvFrame(fd, &frame)) break;
+            const bool authed = c->authed.load();
+            Clock::time_point header_deadline = handshake_deadline;
+            if (authed) {
+                // Between the windows of a push the sender seals and writes,
+                // so a held lease waits at least a step.
+                const int idle = lease_id ? std::max(o.idle_timeout_ms,
+                                                     o.timeout_ms)
+                                          : o.idle_timeout_ms;
+                header_deadline = Clock::now() + std::chrono::milliseconds(idle);
+            }
+            size_t accounted = 0;
+            uint32_t claimed = 0;
+            Rx rr = RecvFrameBy(
+                fd, &frame, authed ? kMaxFrame : kMaxUnauthenticatedFrameBytes,
+                header_deadline,
+                authed ? Clock::now() + std::chrono::milliseconds(o.timeout_ms)
+                       : handshake_deadline,
+                [&](size_t n) {
+                    if (authed) return;
+                    accounted = n;
+                    const size_t now = preauth_buffered.fetch_add(n) + n;
+                    size_t peak = preauth_peak.load();
+                    while (now > peak &&
+                           !preauth_peak.compare_exchange_weak(peak, now)) {
+                    }
+                },
+                &claimed);
+            if (accounted) preauth_buffered.fetch_sub(accounted);
+            if (rr == Rx::kTimeout) {
+                timed_out.fetch_add(1);
+                VLOG(1) << "secure push: closing "
+                        << (authed ? "an idle" : "an unauthenticated")
+                        << " control connection from " << c->ip;
+                break;
+            }
+            if (rr == Rx::kTooLarge) {
+                oversized.fetch_add(1);
+                svc->rejected_.fetch_add(1);
+                LOG(WARNING) << "secure push: dropping a control connection from "
+                             << c->ip << " that claimed a " << claimed
+                             << "-byte " << (authed ? "" : "unauthenticated ")
+                             << "frame";
+                break;
+            }
+            if (rr != Rx::kOk) break;
             SealedInfo info;
             if (frame.size() < kHeaderSize ||
                 !OpenControl(frame, req_aad, &body, &info)) {
                 svc->rejected_.fetch_add(1);
                 LOG(WARNING) << "secure push: dropping a control connection "
-                                "that sent an unauthenticated request";
+                                "from "
+                             << c->ip << " that sent an unauthenticated request";
                 break;
             }
             if (!replay.Accept(info)) {
                 svc->rejected_.fetch_add(1);
                 LOG(WARNING) << "secure push: dropping a control connection "
-                                "that replayed a request";
+                                "from "
+                             << c->ip << " that replayed a request";
                 break;
             }
+            if (!authed && !Authenticate(c)) break;
             const std::string header = frame.substr(0, kHeaderSize);
             Reader r(body.data(), body.size());
             uint8_t type;
@@ -619,7 +852,16 @@ struct SecurePushService::Receiver {
                 svc->rejected_.fetch_add(1);
                 break;
             }
-            if (type == kReqReserve) {
+            if (type == kReqHello) {
+                Writer w;
+                w.U8(kRespHello);
+                w.I32(kOk);
+                w.U32(kHelloVersion);
+                w.U64(reinterpret_cast<uint64_t>(base));
+                w.U64(slot_bytes);
+                w.U32(nslots);
+                if (!Reply(fd, header, w.str())) break;
+            } else if (type == kReqReserve) {
                 uint32_t want;
                 Writer w;
                 w.U8(kRespReserve);
@@ -661,8 +903,14 @@ struct SecurePushService::Receiver {
                 svc->rejected_.fetch_add(1);
                 break;
             }
+            // Do not hold a large commit's buffers while idle.
+            if (frame.capacity() > (1u << 20)) std::string().swap(frame);
+            if (body.capacity() > (1u << 20)) std::string().swap(body);
         }
         Release(lease_id);
+        // The peer sees the close now; the descriptor itself is closed by
+        // the reaper.
+        ::shutdown(fd, SHUT_RDWR);
     }
 
     struct SegCommit {
@@ -820,27 +1068,35 @@ struct SecurePushService::Peer {
     uint64_t rx_base = 0;
     uint64_t slot_bytes = 0;
     uint32_t nslots = 0;
+    int idle_ms = 60000;  // pooled connections older than this are dropped
     std::mutex mu;
-    std::vector<int> idle;
+    std::vector<std::pair<int, Clock::time_point>> idle;
     ~Peer() {
-        for (int fd : idle) ::close(fd);
+        for (auto& [fd, t] : idle) ::close(fd);
     }
-    int Take(int timeout_ms) {
+    // A pooled connection (*reused = true) or a new one.
+    int Take(int timeout_ms, bool* reused) {
         {
             std::lock_guard<std::mutex> lock(mu);
+            const auto now = Clock::now();
             while (!idle.empty()) {
-                int fd = idle.back();
+                auto [fd, t] = idle.back();
                 idle.pop_back();
-                if (IdleConnAlive(fd)) return fd;
+                if (now - t < std::chrono::milliseconds(idle_ms) &&
+                    IdleConnAlive(fd)) {
+                    *reused = true;
+                    return fd;
+                }
                 ::close(fd);
             }
         }
+        *reused = false;
         return Connect(host, port, timeout_ms);
     }
     void Give(int fd) {
         std::lock_guard<std::mutex> lock(mu);
         if (idle.size() < 64)
-            idle.push_back(fd);
+            idle.emplace_back(fd, Clock::now());
         else
             ::close(fd);
     }
@@ -852,6 +1108,7 @@ SecurePushService::SecurePushService(PushFabric fabric, PushOptions options)
     : fabric_(std::move(fabric)), opt_(std::move(options)) {}
 
 SecurePushService::~SecurePushService() {
+    WithdrawP2dEndpoint(fabric_.local_name);
     {
         std::unique_lock<std::mutex> lock(jobs_mu_);
         stopping_ = true;
@@ -879,6 +1136,16 @@ bool SecurePushService::receiver_enabled() const {
     return rx_ != nullptr;
 }
 
+ControlStats SecurePushService::control_stats() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+    return rx_ ? rx_->Stats() : ControlStats{};
+}
+
+void SecurePushService::ForgetPeersForTesting() {
+    std::lock_guard<std::mutex> lock(mu_);
+    peers_.clear();
+}
+
 std::string SecurePushService::control_host() const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
     return rx_ ? rx_->host : std::string();
@@ -897,7 +1164,7 @@ int SecurePushService::EnableReceiver() {
     rx->slot_bytes = (SealedSize(opt_.segment_bytes) + 4095) & ~size_t(4095);
     rx->nslots = static_cast<uint32_t>(
         std::max<size_t>(2, opt_.rx_bytes / rx->slot_bytes));
-    rx->bytes = kBeaconBytes + size_t(rx->nslots) * rx->slot_bytes;
+    rx->bytes = size_t(rx->nslots) * rx->slot_bytes;
     rx->slot_lease.assign(rx->nslots, 0);
     rx->host = opt_.host.empty() ? HostPart(fabric_.local_name) : opt_.host;
 
@@ -939,8 +1206,8 @@ int SecurePushService::EnableReceiver() {
                    : ntohs(reinterpret_cast<sockaddr_in*>(&ss)->sin_port);
     rx->listen_fd = fd;
 
-    // Receive staging: beacon page then slots. Peers can write any of it;
-    // it only ever holds sealed bytes.
+    // Receive staging: slots only. Peers can write any of it; it only ever
+    // holds sealed bytes, and nothing about discovery lives in it.
     void* base = mmap(nullptr, rx->bytes, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (base == MAP_FAILED) {
@@ -950,24 +1217,12 @@ int SecurePushService::EnableReceiver() {
     }
     rx->base = base;
 
-    Writer w;
-    w.U32(kBeaconVersion);
-    w.Str(rx->host);
-    w.U32(static_cast<uint32_t>(rx->port));
-    w.U64(kBeaconBytes);
-    w.U64(rx->slot_bytes);
-    w.U32(rx->nslots);
-    std::string body = std::move(w.str());
-    body.resize(kBeaconBytes - kOverhead, '\0');
-    std::string beacon;
-    if (!SealControl(body, Aad(kAadBeacon, fabric_.local_name), &beacon)) {
-        munmap(base, rx->bytes);
-        rx->base = nullptr;
-        return -1;
-    }
-    memcpy(base, beacon.data(), beacon.size());
-
+    // Advertised before the staging shows up in a descriptor a sender could
+    // fetch; connections wait in the listen backlog until the accept thread
+    // starts.
+    AdvertiseP2dEndpoint(fabric_.local_name, rx->host, rx->port);
     if (fabric_.register_ciphertext(base, rx->bytes) != 0) {
+        WithdrawP2dEndpoint(fabric_.local_name);
         LOG(ERROR) << "secure push: cannot register receive staging";
         munmap(base, rx->bytes);
         rx->base = nullptr;
@@ -1006,52 +1261,67 @@ std::shared_ptr<SecurePushService::Peer> SecurePushService::Discover(
     }
     auto desc = fabric_.segment_desc(target, force);
     if (!desc) return nullptr;
-    auto probe = tx_pool_->Allocate(kBeaconBytes);
-    if (!probe) return nullptr;
-    const std::string aad = Aad(kAadBeacon, desc->name);
-    for (const auto& b : desc->buffers) {
-        if (b.length < kBeaconBytes) continue;
-        Transport::TransferRequest req;
-        req.opcode = Transport::TransferRequest::READ;
-        req.source = probe.data();
-        req.target_id = target;
-        req.target_offset = b.addr;
-        req.length = kBeaconBytes;
-        Status s = fabric_.wait_ops(fabric_.begin_ops({req}), opt_.timeout_ms);
-        if (!s.ok()) {
-            LOG(WARNING) << "secure push: cannot read " << desc->name << " "
-                         << reinterpret_cast<void*>(b.addr) << ": "
-                         << s.ToString();
-            continue;
-        }
-        std::string sealed(static_cast<const char*>(probe.data()), kBeaconBytes);
-        std::string body;
-        SealedInfo info;
-        if (!OpenControl(sealed, aad, &body, &info)) {
-            VLOG(1) << "secure push: no beacon at " << desc->name << " "
-                    << reinterpret_cast<void*>(b.addr);
-            continue;
-        }
-        Reader r(body.data(), body.size());
-        auto peer = std::make_shared<Peer>();
-        uint32_t ver, port;
-        uint64_t slot_off;
-        if (!r.U32(&ver) || ver != kBeaconVersion || !r.Str(&peer->host) ||
-            !r.U32(&port) || !r.U64(&slot_off) || !r.U64(&peer->slot_bytes) ||
-            !r.U32(&peer->nslots) || peer->slot_bytes <= kOverhead ||
-            slot_off + peer->slot_bytes * peer->nslots > b.length)
-            continue;
-        peer->name = desc->name;
-        peer->port = static_cast<int>(port);
-        peer->rx_base = b.addr + slot_off;
-        std::lock_guard<std::mutex> lock(mu_);
-        peers_[target] = peer;
-        return peer;
+    // The endpoint came with the descriptor over the authenticated
+    // handshake; the layout comes from the receiver itself over the sealed
+    // control channel. Nothing here is read from fabric-writable memory.
+    auto peer = std::make_shared<Peer>();
+    peer->name = desc->name;
+    peer->idle_ms = std::max(1, opt_.idle_timeout_ms / 2);
+    if (!LookupP2dEndpoint(desc->name, &peer->host, &peer->port)) {
+        if (force)
+            LOG(ERROR) << "secure push: no secure receiver found on segment "
+                       << desc->name
+                       << " (its descriptor advertises no secure push "
+                          "endpoint)";
+        return nullptr;
     }
-    LOG(ERROR) << "secure push: no secure receiver found on segment "
-               << desc->name << " (" << desc->buffers.size()
-               << " published buffers)";
-    return nullptr;
+    int fd = Connect(peer->host, peer->port, opt_.timeout_ms);
+    if (fd < 0) {
+        LOG(WARNING) << "secure push: cannot connect to " << desc->name
+                     << " at " << peer->host << ":" << peer->port;
+        return nullptr;
+    }
+    Writer w;
+    w.U8(kReqHello);
+    w.Str(fabric_.local_name);
+    std::string frame, reply, body;
+    SealedInfo info;
+    bool ok = SealControl(w.str(), Aad(kAadReq, desc->name), &frame) &&
+              SendFrame(fd, frame) && RecvFrame(fd, &reply) &&
+              OpenControl(reply,
+                          Aad(kAadResp, desc->name, frame.data(), kHeaderSize),
+                          &body, &info);
+    Reader r(body.data(), body.size());
+    uint8_t type = 0;
+    int32_t st = -1;
+    uint32_t ver = 0;
+    ok = ok && r.U8(&type) && type == kRespHello && r.I32(&st) && st == kOk &&
+         r.U32(&ver) && ver == kHelloVersion && r.U64(&peer->rx_base) &&
+         r.U64(&peer->slot_bytes) && r.U32(&peer->nslots) &&
+         peer->slot_bytes > kOverhead && peer->nslots > 0 &&
+         peer->slot_bytes * peer->nslots / peer->nslots == peer->slot_bytes;
+    // The slots must lie in one buffer the (authenticated) descriptor
+    // publishes, i.e. the receiver's registered staging.
+    bool published = false;
+    if (ok) {
+        const uint64_t span = peer->slot_bytes * peer->nslots;
+        for (const auto& b : desc->buffers)
+            if (peer->rx_base >= b.addr && span <= b.length &&
+                peer->rx_base - b.addr <= b.length - span)
+                published = true;
+    }
+    if (!ok || !published) {
+        LOG(WARNING) << "secure push: " << desc->name
+                     << (ok ? " described receive slots outside its published "
+                              "buffers"
+                            : " did not answer the discovery request");
+        ::close(fd);
+        return nullptr;
+    }
+    peer->Give(fd);
+    std::lock_guard<std::mutex> lock(mu_);
+    peers_[target] = peer;
+    return peer;
 }
 
 // ------------------------------------------------------------------- job --
@@ -1184,26 +1454,15 @@ bool SecurePushService::RunJob(Job& job) {
     if (job.total == 0) return true;
     if (!EnsureSender()) return false;
     RAND_bytes(job.tid, sizeof(job.tid));
-    auto peer = Discover(job.target, false);
-    if (!peer) peer = Discover(job.target, true);
-    if (!peer) return false;
-
     const auto deadline_ms = opt_.timeout_ms;
-    int fd = peer->Take(deadline_ms);
-    if (fd < 0) {
-        LOG(ERROR) << "secure push: cannot connect to " << peer->host << ":"
-                   << peer->port;
-        std::lock_guard<std::mutex> lock(mu_);
-        peers_.erase(job.target);  // rediscover next time
-        return false;
-    }
+    std::shared_ptr<Peer> peer;
+    int fd = -1;
     bool reusable = false;
     // Request headers awaiting replies, in order.
     std::deque<std::string> pending;
-    const std::string req_aad = Aad(kAadReq, peer->name);
     auto send = [&](const std::string& body) {
         std::string frame;
-        if (!SealControl(body, req_aad, &frame)) return false;
+        if (!SealControl(body, Aad(kAadReq, peer->name), &frame)) return false;
         if (hooks_.on_frame_sent) hooks_.on_frame_sent(frame);
         pending.push_back(frame.substr(0, kHeaderSize));
         return SendFrame(fd, frame);
@@ -1224,47 +1483,99 @@ bool SecurePushService::RunJob(Job& job) {
         return true;
     };
 
-    // Segment size: ours, capped by the peer's slot.
-    size_t seg_bytes = std::min(opt_.segment_bytes, size_t(peer->slot_bytes) - kOverhead);
-    seg_bytes &= ~size_t(63);
-    const uint32_t nseg =
-        static_cast<uint32_t>((job.total + seg_bytes - 1) / seg_bytes);
-
-    // Reserve slots.
+    size_t seg_bytes = 0;
+    uint32_t nseg = 0;
     std::vector<uint32_t> slots;
     uint64_t lease = 0;
+
+    // Reserve slots. A connection that fails before its reserve is answered
+    // (a pooled one the receiver closed as idle, a new one dropped while
+    // unauthenticated) is replaced; a new connection that fails sends the
+    // sender back to discovery, with backoff, until the step timeout.
     {
-        const uint32_t want = static_cast<uint32_t>(
-            std::min<size_t>(nseg, 2 * opt_.window_segments));
-        auto until = Clock::now() + std::chrono::milliseconds(deadline_ms);
+        constexpr int kMaxConnectAttempts = 6;
+        const auto until = Clock::now() + std::chrono::milliseconds(deadline_ms);
         int backoff_us = 100;
+        int conn_backoff_ms = 1;
+        int conn_failures = 0;
         for (;;) {
-            Writer w;
-            w.U8(kReqReserve);
-            w.Str(fabric_.local_name);
-            w.U32(want);
-            std::string body;
-            if (!send(w.str()) || !recv(&body)) goto fail;
-            Reader r(body.data(), body.size());
-            uint8_t type;
-            int32_t st;
-            uint64_t slot_bytes;
-            uint32_t n;
-            if (!r.U8(&type) || type != kRespReserve || !r.I32(&st) ||
-                st != kOk || !r.U64(&lease) || !r.U64(&slot_bytes) ||
-                !r.U32(&n) || n > peer->nslots || slot_bytes != peer->slot_bytes)
-                goto fail;
-            slots.resize(n);
-            for (auto& s : slots)
-                if (!r.U32(&s) || s >= peer->nslots) goto fail;
-            if (n > 0) break;
-            if (Clock::now() > until) {
-                LOG(ERROR) << "secure push: " << peer->name
-                           << " granted no receive slots before the timeout";
-                goto fail;
+            if (!peer) {
+                peer = Discover(job.target, conn_failures > 0);
+                if (!peer && conn_failures == 0)
+                    peer = Discover(job.target, true);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
-            backoff_us = std::min(backoff_us * 2, 5000);
+            bool reused = false;
+            if (peer) fd = peer->Take(deadline_ms, &reused);
+            if (peer && fd >= 0) {
+                // Segment size: ours, capped by the peer's slot.
+                seg_bytes = std::min(opt_.segment_bytes,
+                                     size_t(peer->slot_bytes) - kOverhead) &
+                            ~size_t(63);
+                nseg = static_cast<uint32_t>((job.total + seg_bytes - 1) /
+                                             seg_bytes);
+                const uint32_t want = static_cast<uint32_t>(
+                    std::min<size_t>(nseg, 2 * opt_.window_segments));
+                pending.clear();
+                enum { kGranted, kConnLost, kRefused } rc = kGranted;
+                for (;;) {
+                    Writer w;
+                    w.U8(kReqReserve);
+                    w.Str(fabric_.local_name);
+                    w.U32(want);
+                    std::string body;
+                    if (!send(w.str()) || !recv(&body)) {
+                        rc = kConnLost;
+                        break;
+                    }
+                    Reader r(body.data(), body.size());
+                    uint8_t type;
+                    int32_t st;
+                    uint64_t slot_bytes;
+                    uint32_t n;
+                    if (!r.U8(&type) || type != kRespReserve || !r.I32(&st) ||
+                        st != kOk || !r.U64(&lease) || !r.U64(&slot_bytes) ||
+                        !r.U32(&n) || n > peer->nslots ||
+                        slot_bytes != peer->slot_bytes) {
+                        rc = kRefused;
+                        break;
+                    }
+                    slots.resize(n);
+                    for (auto& sl : slots)
+                        if (!r.U32(&sl) || sl >= peer->nslots) rc = kRefused;
+                    if (rc != kGranted || n > 0) break;
+                    if (Clock::now() > until) {
+                        LOG(ERROR) << "secure push: " << peer->name
+                                   << " granted no receive slots before the "
+                                      "timeout";
+                        rc = kRefused;
+                        break;
+                    }
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(backoff_us));
+                    backoff_us = std::min(backoff_us * 2, 5000);
+                }
+                if (rc == kGranted) break;
+                ::close(fd);
+                fd = -1;
+                if (rc == kRefused) return false;
+                if (reused) continue;  // try the next pooled one, or a new one
+            }
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                peers_.erase(job.target);  // rediscover
+            }
+            peer.reset();
+            if (++conn_failures >= kMaxConnectAttempts ||
+                Clock::now() > until) {
+                LOG(ERROR) << "secure push: cannot reach the secure receiver "
+                              "of segment "
+                           << job.target << " after " << conn_failures
+                           << " attempts";
+                return false;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(conn_backoff_ms));
+            conn_backoff_ms = std::min(conn_backoff_ms * 4, 250);
         }
     }
 

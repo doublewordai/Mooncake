@@ -81,6 +81,17 @@ value) never falls back to plaintext: the transfer engine refuses to install
 transports, servers that would serve RPC abort, and the control plane makes
 and accepts no tags.
 
+## Secure push discovery and control limits
+
+A sender finds a receiver's push control endpoint in the receiver's segment
+descriptor, which travels only over the authenticated handshake, and gets its
+slot layout over the sealed control channel; nothing about discovery is kept
+in NIC-registered (fabric-writable) memory. The control server bounds what an
+unauthenticated connection can cost (frame size, time, count per source and
+in total) separately from authenticated ones. Both are described, with their
+`MC_SECURE_P2D_*` limits, in
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h).
+
 ## What secure mode refuses
 
 - Metadata other than `P2PHANDSHAKE` (etcd, redis, HTTP): the engine aborts at
@@ -99,5 +110,10 @@ and accepts no tags.
 - Store RPCs and handshakes without a valid, fresh, unreplayed tag (answered
   with code 401 / dropped).
 
-Not covered: the master admin HTTP API (metrics, key listing, drain jobs) is
-not authenticated; keep it off untrusted networks.
+The master's admin and metrics HTTP server (`--metrics_port`: `/metrics`,
+key and segment queries, `remove_all`, drain jobs, tenant quotas) is not
+authenticated, so in secure mode it binds to loopback only, in the master, the
+HA supervisor and the embedded master alike; `MC_SECURE_ADMIN_BIND` names
+another address. Reach it from inside the pod (`kubectl exec`, or a process
+beside the master) or with `kubectl port-forward`, which needs no sidecar
+([`mooncake-store/src/secure/rpc_auth.h`](../../../mooncake-store/src/secure/rpc_auth.h)).

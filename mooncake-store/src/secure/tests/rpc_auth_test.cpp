@@ -7,7 +7,14 @@
 
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -17,6 +24,7 @@
 #include "common/network.h"
 #include "control_auth.h"
 #include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "master_client.h"
 #include "rpc_auth.h"
 #include "rpc_registrar.h"
@@ -235,6 +243,78 @@ TEST_F(RpcAuthTest, ServerWithoutKeyRefusesToStart) {
 TEST_F(RpcAuthTest, HttpMetadataServerRefusesToStart) {
     HttpMetadataServer meta(static_cast<uint16_t>(port_), "127.0.0.1");
     EXPECT_FALSE(meta.start());
+}
+
+// True if a TCP connection to addr:port is accepted.
+bool Connects(const std::string &addr, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(static_cast<uint16_t>(port));
+    inet_pton(AF_INET, addr.c_str(), &a.sin_addr);
+    bool ok = connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) == 0;
+    close(fd);
+    return ok;
+}
+
+// This host's addresses other than loopback: what a peer on another node
+// (or in another network namespace) would connect to.
+std::vector<std::string> NonLoopbackAddresses() {
+    std::vector<std::string> out;
+    ifaddrs *ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) return out;
+    for (auto *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET,
+                  &reinterpret_cast<sockaddr_in *>(i->ifa_addr)->sin_addr, buf,
+                  sizeof(buf));
+        if (std::string(buf).rfind("127.", 0) != 0) out.push_back(buf);
+    }
+    freeifaddrs(ifs);
+    return out;
+}
+
+// The master's admin/metrics server (unauthenticated: remove_all, key and
+// segment queries) answers only on loopback in secure mode, wherever the
+// caller asked it to bind; MC_SECURE_ADMIN_BIND overrides; off, the requested
+// address stands.
+TEST_F(RpcAuthTest, MasterAdminServerIsLoopbackOnly) {
+    unsetenv("MC_SECURE_ADMIN_BIND");
+    EXPECT_EQ(secure::AdminBindHost("0.0.0.0"), "127.0.0.1");
+    setenv("MC_SECURE_ADMIN_BIND", "10.1.2.3", 1);
+    EXPECT_EQ(secure::AdminBindHost("0.0.0.0"), "10.1.2.3");
+    unsetenv("MC_SECURE_ADMIN_BIND");
+    ca::ConfigureForTesting(false, "");
+    EXPECT_EQ(secure::AdminBindHost("0.0.0.0"), "0.0.0.0");
+    ca::ConfigureForTesting(true, kSecretA);
+
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    MasterAdminServer admin(static_cast<uint16_t>(port_), false, "0.0.0.0");
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    // Refused from any other address.
+    EXPECT_FALSE(Connects("127.0.0.2", port_));
+    for (const auto &addr : NonLoopbackAddresses())
+        EXPECT_FALSE(Connects(addr, port_)) << addr;
+    // Served on loopback.
+    const std::string base = "http://127.0.0.1:" + std::to_string(port_);
+    coro_http::coro_http_client metrics;
+    auto m = metrics.get(base + "/metrics");
+    EXPECT_EQ(m.status, 200);
+    coro_http::coro_http_client query;
+    auto q = query.get(base + "/query_key?key=absent");
+    EXPECT_NE(q.status, 0);  // an HTTP answer from the handler
+    EXPECT_NE(std::string(q.resp_body).find("success"), std::string::npos)
+        << q.resp_body;
+    admin.Stop();
 }
 
 // The master as deployed: RegisterRpcService with a worker pool, and

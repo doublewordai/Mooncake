@@ -9,6 +9,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "rpc_registrar.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -35,8 +36,9 @@ DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
 namespace mooncake {
-void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
+void RegisterClientRpcService(coro_rpc::coro_rpc_server &rpc_server,
                               RealClient &real_client) {
+    RpcRegistrar server(rpc_server);
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);

@@ -50,6 +50,7 @@
 #include "common/network.h"
 #include "common/result.h"
 #include "rpc_types.h"
+#include "rpc_registrar.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
@@ -1460,11 +1461,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // Use port 0 to let the OS auto-allocate an available port.
         offload_rpc_server_ =
             std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
-        offload_rpc_server_
-            ->register_handler<&RealClient::batch_get_offload_object>(this);
-        offload_rpc_server_
-            ->register_handler<&RealClient::release_offload_buffer>(this);
-        offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
+        RpcRegistrar offload_handlers(*offload_rpc_server_);
+        offload_handlers
+            .register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_handlers.register_handler<&RealClient::release_offload_buffer>(
+            this);
+        offload_handlers.register_handler<&RealClient::verify_disk_replica>(
             this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
@@ -9122,8 +9124,8 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client &client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    return RpcSendRequest<ServiceMethod>(
+                        client, std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";

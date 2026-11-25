@@ -537,8 +537,19 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     return len - nbytes;
 }
 
+// Replaces the handshake framing below when set. Installed once, when a
+// TransferMetadata is created, by a -DWITH_SECURE_KV=ON build in secure mode
+// (src/secure/); null otherwise.
+struct HandshakeFramingHook {
+    int (*write)(int fd, HandShakeRequestType type, const std::string &str);
+    std::pair<HandShakeRequestType, std::string> (*read)(int fd);
+};
+inline const HandshakeFramingHook *g_handshake_framing_hook = nullptr;
+
 static inline int writeString(int fd, const HandShakeRequestType type,
                               const std::string &str) {
+    if (g_handshake_framing_hook)
+        return g_handshake_framing_hook->write(fd, type, str);
     uint8_t byte = static_cast<uint8_t>(type);
     // LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
     //           << "): " << str;
@@ -623,6 +634,7 @@ static inline size_t getHandshakeMaxNotifyEntries() {
 }
 
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
+    if (g_handshake_framing_hook) return g_handshake_framing_hook->read(fd);
     HandShakeRequestType type = HandShakeRequestType::Invalid;
 
     const size_t kMaxLength = getHandshakeMaxLength();

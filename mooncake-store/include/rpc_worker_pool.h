@@ -14,6 +14,8 @@
 #include <ylt/util/type_traits.h>
 #include <ylt/util/utils.hpp>
 
+#include "rpc_registrar.h"
+
 namespace mooncake {
 
 namespace rpc_worker_pool_detail {
@@ -78,6 +80,9 @@ class RpcWorkerPool {
         using Handler = rpc_worker_pool_detail::PooledHandler<Method, Service>;
         auto handler =
             std::make_shared<Handler>(service, threads_.get_executor());
+#ifdef MOONCAKE_WITH_SECURE_KV
+        if (secure::RegisterAuthed<Method>(server, handler, handlers_)) return;
+#endif
         server.register_handler<&Handler::Handle>(handler.get(),
                                                   coro_rpc::func_id<Method>());
         handlers_.push_back(std::move(handler));

@@ -833,3 +833,7 @@ if(WITH_STORE_C_SHARED)
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
 endif()
+
+if(WITH_SECURE_KV)
+  add_subdirectory(secure)
+endif()

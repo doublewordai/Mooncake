@@ -102,6 +102,10 @@ if(UNIX AND NOT APPLE)
 endif()
 if(WITH_SECURE_KV)
   target_link_libraries(transfer_engine PUBLIC OpenSSL::Crypto)
+  # The handshake framing hook (installed from TransferMetadata's constructor).
+  target_sources(transfer_engine
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/secure/handshake_auth.cpp)
+  target_link_libraries(transfer_engine PUBLIC mooncake_control_auth)
 endif()
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)

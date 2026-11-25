@@ -1,5 +1,9 @@
 # Secure-mode authentication of coro_rpc requests. Built only with
 # WITH_SECURE_KV; see rpc_auth.h.
+# Hidden, as the transfer engine's secure code
+# (mooncake-transfer-engine/src/secure/CMakeLists.txt).
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_library(mooncake_store_secure STATIC rpc_auth.cpp)
 set_target_properties(mooncake_store_secure
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)

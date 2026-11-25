@@ -1,5 +1,15 @@
 # Secure mode (DW-1288): built only with -DWITH_SECURE_KV=ON.
 
+# Each module that links the transfer engine and the store statically
+# (engine.so, _store.so) carries its own hidden copy of the secure code
+# (SECURE_KV.md, "One copy per module"). Shared libraries would split it
+# across libraries, which hidden symbols cannot cross.
+if(BUILD_SHARED_LIBS)
+  message(FATAL_ERROR "WITH_SECURE_KV needs BUILD_SHARED_LIBS=OFF")
+endif()
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
 # Data path: KV crypto, the secure transport decorator, the staging pool and
 # the secure P->D push. Compiled into transfer_engine (see ../CMakeLists.txt).
 add_library(mooncake_secure OBJECT kv_crypto.cpp secure_transport.cpp

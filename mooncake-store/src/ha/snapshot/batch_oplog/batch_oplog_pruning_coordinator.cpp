@@ -163,6 +163,13 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
                           *fallback_descriptor, stopped))
         return ErrorCode::INTERNAL_ERROR;
     if (stopped()) return ErrorCode::ETCD_TRANSACTION_FAIL;
+    // A store that lives on the masters keeps a snapshot only where it was
+    // written or fetched: prune behind it only once enough live masters hold
+    // it, so a standby that starts with no local state can still restore.
+    if (!object_store_.RetainedForPruning(
+            ha::BuildBatchOpLogSnapshotArtifactPrefix(
+                snapshot_root_, fallback_descriptor->snapshot_id)))
+        return metric_timer.Success(ErrorCode::OK);
 
     KvTxn txn;
     txn.compares = {{.key = lock_key,

@@ -19,6 +19,16 @@ RpcTimeoutConfig RpcTimeoutConfig::FromEnvironment() {
         config.connect_timeout =
             std::chrono::milliseconds{std::atoll(value->c_str())};
     }
+    if (const auto value = Environ::Read(Variables::MC_RPC_CONNECT_RETRIES)) {
+        const long long retries = std::atoll(value->c_str());
+        config.connect_retries =
+            static_cast<uint32_t>(retries < 0 ? 0 : retries);
+    }
+    if (const auto value =
+            Environ::Read(Variables::MC_RPC_RECONNECT_WAIT_MS)) {
+        const long long wait = std::atoll(value->c_str());
+        config.reconnect_wait = std::chrono::milliseconds{wait < 0 ? 0 : wait};
+    }
     return config;
 }
 

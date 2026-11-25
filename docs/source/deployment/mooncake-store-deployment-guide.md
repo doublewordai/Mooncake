@@ -761,7 +761,7 @@ mooncake_master \
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch snapshot chunk |
 | `--snapshot_interval_seconds` | `600` (10 min) | Interval between standby batch snapshots |
-| `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
+| `--snapshot_object_store_type` | required | Object store: `local`, `s3`, or `peer` (each master keeps snapshots in its local directory and the masters fetch them from each other over authenticated RPC; no shared storage. See [`peer_snapshot_object_store.h`](../../../mooncake-store/include/ha/snapshot/object/backends/peer/peer_snapshot_object_store.h) for its environment variables) |
 
 **Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for batch snapshots.
 
@@ -1305,6 +1305,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
 | `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
 | `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` initially; `1000` during HA runtime | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. HA clients retain the normal retry budget during initial discovery and configuration, then use one bounded attempt per runtime reconnect because their monitor and heartbeat loops own the retry schedule. An explicit value overrides both defaults. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
+| `MC_RPC_CONNECT_RETRIES`, `MC_RPC_RECONNECT_WAIT_MS` | `3`, `1000` | The master client's foreground pool (object calls): connect attempts after the first, and the wait (jittered up to 1.2x) between attempts. A call to a leader that has gone spends (1 + retries) x wait before it fails, about 4.3 s at the defaults; HA clients, whose monitor moves them to the new leader, can set both to `0` so such calls fail within one connect attempt. The HA control pools always make one attempt |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |

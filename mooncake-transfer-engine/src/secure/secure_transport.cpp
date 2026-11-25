@@ -387,7 +387,7 @@ int SecureTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 // Local-only memory can be a push destination, so the first registration of
-// it brings up the receive side (staging, beacon, control server).
+// it brings up the receive side (staging, control server).
 int SecureTransport::EnableReceiver() {
     if (!push_) return 0;
     if (push_->EnableReceiver() == 0) return 0;

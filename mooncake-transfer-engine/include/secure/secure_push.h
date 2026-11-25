@@ -38,9 +38,21 @@
 // segment cannot be committed to other destinations, another transfer or
 // another receiver.
 //
-// Discovery: the receiver writes a sealed beacon (control endpoint and slot
-// layout, bound to its segment name) at the start of its receive staging; a
-// sender reads it once per peer with a fabric READ into its own staging.
+// Discovery never touches fabric-writable memory. A receiver advertises its
+// control endpoint (host, port) inside its segment descriptor as it goes out
+// over the authenticated P2P handshake (handshake_auth.h); a sender takes the
+// endpoint from the descriptor it fetched and asks the receiver for its slot
+// layout with a HELLO on the sealed control channel. The receive staging
+// holds only slots.
+//
+// Control server limits: a connection is unauthenticated until its first
+// request opens; until then its frame may be at most
+// kMaxUnauthenticatedFrameBytes (the largest legitimate first request) and
+// must arrive within the handshake timeout. Unauthenticated connections are
+// capped in total and per source address, separately from authenticated
+// ones; when a cap is full the oldest unauthenticated connection from the
+// address holding the most is dropped, so a flood cannot keep a new sender
+// out. Authenticated connections close after the idle timeout.
 //
 // Everything here runs only in secure mode (SecureTransport owns the
 // service); with secure mode off none of it is constructed.
@@ -84,6 +96,15 @@ namespace secure {
 //   MC_SECURE_P2D_RX_COPY          1 (default): copy each sealed segment out
 //                                  of the remotely writable slot before
 //                                  opening it; 0: open in place
+//   MC_SECURE_P2D_MAX_CONNS        authenticated control connections (1024)
+//   MC_SECURE_P2D_MAX_PREAUTH      unauthenticated control connections (256)
+//   MC_SECURE_P2D_MAX_PREAUTH_PER_IP  of those, from one address (64)
+//   MC_SECURE_P2D_HANDSHAKE_TIMEOUT_MS  time a new connection has to send
+//                                  an authenticated request (5000)
+//   MC_SECURE_P2D_IDLE_TIMEOUT_MS  authenticated connection idle (no lease)
+//                                  before the receiver closes it (120000);
+//                                  senders drop pooled connections idle for
+//                                  half of it
 struct PushOptions {
     size_t threads = 4;
     size_t segment_bytes = 2ull << 20;
@@ -95,8 +116,30 @@ struct PushOptions {
     int port = 0;
     int timeout_ms = 30000;
     bool rx_copy = true;
+    size_t max_conns = 1024;
+    size_t max_preauth = 256;
+    size_t max_preauth_per_ip = 64;
+    int handshake_timeout_ms = 5000;
+    int idle_timeout_ms = 120000;
 
     static PushOptions FromEnv();
+};
+
+// The largest frame the control server reads from a connection that has not
+// yet sent an authenticated request: a sealed HELLO or RESERVE with a sender
+// name of at most 4096 bytes fits.
+constexpr size_t kMaxUnauthenticatedFrameBytes = 8192;
+
+// Control server accounting (tests, logs).
+struct ControlStats {
+    size_t preauth_conns = 0;      // open, not yet authenticated
+    size_t auth_conns = 0;         // open, authenticated
+    uint64_t refused_conns = 0;    // authenticated over MC_SECURE_P2D_MAX_CONNS
+    uint64_t evicted_conns = 0;    // unauthenticated, dropped for a newer one
+    uint64_t timed_out_conns = 0;  // handshake or idle timeout
+    uint64_t oversized_frames = 0; // length claim over the connection's cap
+    size_t preauth_buffer_peak = 0;  // most bytes ever buffered at once for
+                                     // unauthenticated frames
 };
 
 // Parses "0-3,8,10-11". Returns false on malformed input.
@@ -154,7 +197,8 @@ struct PushTestHooks {
     // its commit is sent. Arguments: peer addresses and sizes of the slots.
     std::function<void(const std::vector<std::pair<uint64_t, size_t>>&)>
         before_commit;
-    // Sender: every control frame sent (sealed bytes, without the length).
+    // Sender: every RESERVE and COMMIT frame a push sends (sealed bytes,
+    // without the length); discovery HELLOs are not reported.
     std::function<void(const std::string& frame)> on_frame_sent;
     // Sender: the header of every sealed data segment.
     std::function<void(const SealedInfo& info)> on_segment_sealed;
@@ -167,7 +211,8 @@ class SecurePushService {
     SecurePushService(const SecurePushService&) = delete;
     SecurePushService& operator=(const SecurePushService&) = delete;
 
-    // Brings up the receive side (staging, beacon, control server).
+    // Brings up the receive side (staging, control server) and advertises
+    // the control endpoint in this engine's handshake descriptor.
     // Idempotent; 0 on success.
     int EnableReceiver();
     bool receiver_enabled() const;
@@ -192,6 +237,10 @@ class SecurePushService {
                                               int timeout_ms);
     // Rx statistics for tests.
     uint64_t rejected_requests() const { return rejected_.load(); }
+    ControlStats control_stats() const;
+    // Forgets every discovered peer and pooled connection, so the next push
+    // discovers and connects as a new sender would.
+    void ForgetPeersForTesting();
 
     struct Peer;
     struct Receiver;

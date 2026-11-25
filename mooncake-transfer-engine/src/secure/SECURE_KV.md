@@ -81,6 +81,17 @@ value) never falls back to plaintext: the transfer engine refuses to install
 transports, servers that would serve RPC abort, and the control plane makes
 and accepts no tags.
 
+## Secure push discovery and control limits
+
+A sender finds a receiver's push control endpoint in the receiver's segment
+descriptor, which travels only over the authenticated handshake, and gets its
+slot layout over the sealed control channel; nothing about discovery is kept
+in NIC-registered (fabric-writable) memory. The control server bounds what an
+unauthenticated connection can cost (frame size, time, count per source and
+in total) separately from authenticated ones. Both are described, with their
+`MC_SECURE_P2D_*` limits, in
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h).
+
 ## What secure mode refuses
 
 - Metadata other than `P2PHANDSHAKE` (etcd, redis, HTTP): the engine aborts at

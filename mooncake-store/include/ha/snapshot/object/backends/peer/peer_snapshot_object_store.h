@@ -24,6 +24,23 @@
 //   MOONCAKE_SNAPSHOT_PEER_MIN_HOLDERS live masters, this one included, that
 //                                      must hold a snapshot before the OpLog is
 //                                      pruned behind it (default 2)
+//   MOONCAKE_SNAPSHOT_PEER_RESET_GRACE_S seconds the cluster must stay
+//                                      unrestorable before it is reset to
+//                                      empty (default 60; 0 never resets)
+//
+// The store is a cache, so an unrestorable cluster starts empty rather than
+// staying down. It is unrestorable when the OpLog has been pruned (a
+// compaction floor exists) and no live master, this one included, holds the
+// latest or fallback snapshot. Once that has held continuously for the grace
+// period with no leader serving, one master resets it: an etcd transaction,
+// fenced on everything it observed (pointers, floor, master view, the
+// maintenance lock, the epoch), bumps the cluster's snapshot epoch
+// (PeerSnapshotEpochKey) and marks both pointers as reset; it then deletes the
+// OpLog batches, the durable prefix, the floor and the pointers, in that
+// order, so that a standby restoring at any point in between either fails or
+// restores an empty index, never a partial one. Any master finishes a reset
+// it finds marked but unfinished. Masters drop their local snapshots when the
+// epoch changes.
 
 #include <atomic>
 #include <chrono>
@@ -59,6 +76,8 @@ struct PeerSnapshotStoreOptions {
     // this often otherwise.
     std::chrono::milliseconds announce_every{10000};
     std::chrono::milliseconds peer_stale_after{30000};
+    // Zero disables the reset to empty.
+    std::chrono::milliseconds reset_grace{60000};
     std::chrono::milliseconds connect_timeout{1000};
     std::chrono::milliseconds request_timeout{10000};
     // Tests drive Tick() themselves.
@@ -105,6 +124,10 @@ class PeerSnapshotService {
 };
 
 std::string PeerSnapshotRegistryPrefix(const std::string& cluster_id);
+// The cluster's snapshot epoch: absent before the first reset, then 1, 2, ...
+std::string PeerSnapshotEpochKey(const std::string& cluster_id);
+// What a reset leaves in the latest and fallback pointers until it finishes.
+inline constexpr char kPeerSnapshotResetMarker[] = "reset-in-progress";
 
 class PeerSnapshotObjectStore final : public SnapshotObjectStore {
    public:
@@ -169,6 +192,12 @@ class PeerSnapshotObjectStore final : public SnapshotObjectStore {
     void Announce(bool force);
     void CollectLocalGarbage(uint64_t keep_from_batch);
     void Loop();
+    // The reset to empty (see the file comment).
+    void MaybeReset(const std::optional<std::string>& latest,
+                    const std::optional<std::string>& fallback);
+    void FinishReset();
+    bool PeerAnswersFor(const std::string& address, const std::string& key);
+    void WipeLocalSnapshots();
 
     PeerSnapshotStoreOptions options_;
     HaKvBackend& backend_;
@@ -185,6 +214,8 @@ class PeerSnapshotObjectStore final : public SnapshotObjectStore {
     std::string last_announced_;
     std::chrono::steady_clock::time_point last_announce_{};
     std::atomic<uint64_t> fetch_seq_{0};
+    std::optional<std::chrono::steady_clock::time_point> unrestorable_since_;
+    std::optional<std::string> seen_epoch_;
 
     std::mutex loop_mutex_;
     std::condition_variable loop_cv_;

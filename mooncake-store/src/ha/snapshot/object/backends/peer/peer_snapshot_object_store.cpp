@@ -20,6 +20,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "crc32c.h"
+#include "ha_metric_manager.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
@@ -669,6 +670,10 @@ void PeerSnapshotObjectStore::Tick() {
             WipeLocalSnapshots();
         }
         seen_epoch_ = now_epoch.value_or("");
+        const uint64_t value =
+            std::strtoull(seen_epoch_->c_str(), nullptr, 10);
+        HAMetricManager::instance().update_snapshot_runtime(
+            [value](auto& metrics) { metrics.reset_epoch = value; });
     }
 
     std::optional<uint64_t> keep_from;
@@ -870,6 +875,10 @@ void PeerSnapshotObjectStore::MaybeReset(
         return;
     }
     seen_epoch_ = std::to_string(next_epoch);
+    HAMetricManager::instance().update_snapshot_runtime([next_epoch](auto& m) {
+        m.reset_epoch = next_epoch;
+        ++m.resets_total;
+    });
     LOG(ERROR) << "Peer snapshot store: RESETTING cluster " << c
                << " to EMPTY (snapshot epoch " << next_epoch
                << "): unrestorable for "

@@ -517,8 +517,15 @@ TEST_F(PeerSnapshotResetTest, UnrestorableClusterStartsEmptyAfterGrace) {
     EXPECT_EQ("(absent)", Epoch());
     EXPECT_EQ(2u, BatchCount());
     std::this_thread::sleep_for(kGrace + std::chrono::milliseconds(50));
+    const auto resets_before =
+        HAMetricManager::instance().get_snapshot_runtime().resets_total;
     b.Tick();
     EXPECT_EQ("1", Epoch());
+    // Visible on the master's /metrics (ha_snapshot_reset_epoch).
+    EXPECT_EQ(1u,
+              HAMetricManager::instance().get_snapshot_runtime().reset_epoch);
+    EXPECT_EQ(resets_before + 1,
+              HAMetricManager::instance().get_snapshot_runtime().resets_total);
     EXPECT_EQ(0u, BatchCount());
     EXPECT_EQ("(absent)", Get(BuildDurablePrefixKey(kCluster)));
     EXPECT_EQ("(absent)", Floor().empty() ? "(absent)" : Floor());

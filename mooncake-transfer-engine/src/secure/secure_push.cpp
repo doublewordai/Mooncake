@@ -14,6 +14,8 @@
 
 #include "secure/secure_push.h"
 
+#include "secure/device_copy.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glog/logging.h>
@@ -299,119 +301,8 @@ bool IdleConnAlive(int fd) {
 
 // --------------------------------------------------------------- memory --
 
-// Device the pointer lives on, or -1 for host-accessible memory.
-int DeviceOf(const void* p) {
-#ifdef USE_CUDA
-    cudaPointerAttributes a{};
-    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
-        cudaGetLastError();
-        return -1;
-    }
-    if (a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged)
-        return a.device;
-#else
-    (void)p;
-#endif
-    return -1;
-}
-
-// Per-thread pinned host bounce buffer and per-device copy streams.
-struct Bounce {
-    void* host = nullptr;
-    size_t size = 0;
-    bool pinned = false;
-#ifdef USE_CUDA
-    std::map<int, cudaStream_t> streams;
-#endif
-    ~Bounce() { Release(); }
-    void Release() {
-        if (!host) return;
-        OPENSSL_cleanse(host, size);
-#ifdef USE_CUDA
-        if (pinned) {
-            cudaFreeHost(host);
-        } else {
-            free(host);
-        }
-#else
-        free(host);
-#endif
-        host = nullptr;
-    }
-    void* Get(size_t n) {
-        if (size >= n) return host;
-        Release();
-        size = 0;
-        pinned = false;
-#ifdef USE_CUDA
-        if (cudaHostAlloc(&host, n, cudaHostAllocPortable) == cudaSuccess) {
-            pinned = true;
-        } else {
-            cudaGetLastError();
-            host = nullptr;
-        }
-#endif
-        if (!host) host = malloc(n);
-        if (host) size = n;
-        return host;
-    }
-#ifdef USE_CUDA
-    cudaStream_t Stream(int dev) {
-        auto it = streams.find(dev);
-        if (it != streams.end()) return it->second;
-        cudaStream_t s = nullptr;
-        cudaSetDevice(dev);
-        if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) !=
-            cudaSuccess) {
-            cudaGetLastError();
-            return nullptr;
-        }
-        streams[dev] = s;
-        return s;
-    }
-#endif
-};
-
-thread_local Bounce t_bounce;
+// Private copy of a remotely writable receive slot (see OpenSegment).
 thread_local std::vector<uint8_t> t_private;
-
-struct DevCopy {
-    void* dst;
-    const void* src;
-    size_t n;
-    int dev;
-};
-
-// Copies between host and device memory with the copy engine: every copy is
-// queued on its device's stream, then each stream is synchronised once.
-bool CopyDevice(const std::vector<DevCopy>& copies) {
-#ifdef USE_CUDA
-    std::vector<int> used;
-    bool ok = true;
-    for (const auto& c : copies) {
-        cudaSetDevice(c.dev);
-        cudaStream_t s = t_bounce.Stream(c.dev);
-        if (!s || cudaMemcpyAsync(c.dst, c.src, c.n, cudaMemcpyDefault, s) !=
-                      cudaSuccess) {
-            ok = false;
-            break;
-        }
-        if (std::find(used.begin(), used.end(), c.dev) == used.end())
-            used.push_back(c.dev);
-    }
-    for (int d : used) {
-        cudaSetDevice(d);
-        if (cudaStreamSynchronize(t_bounce.Stream(d)) != cudaSuccess)
-            ok = false;
-    }
-    if (!ok)
-        LOG(ERROR) << "secure push: device copy failed: "
-                   << cudaGetErrorString(cudaGetLastError());
-    return ok;
-#else
-    return copies.empty();
-#endif
-}
 
 // ----------------------------------------------------------- replay guard --
 
@@ -468,25 +359,6 @@ class ReplayGuard {
     std::mutex mu_;
     std::map<std::string, Window> windows_;
     uint64_t tick_ = 0;
-};
-
-// A countdown latch.
-class Latch {
-   public:
-    explicit Latch(size_t n) : n_(n) {}
-    void CountDown() {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (n_ && --n_ == 0) cv_.notify_all();
-    }
-    void Wait() {
-        std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [&] { return n_ == 0; });
-    }
-
-   private:
-    std::mutex mu_;
-    std::condition_variable cv_;
-    size_t n_;
 };
 
 std::string HostPart(const std::string& name) {
@@ -910,7 +782,7 @@ struct SecurePushService::Receiver {
             return e == Error::kOk;
         }
         const size_t pt = s.sealed_len - kOverhead;
-        auto* bounce = static_cast<uint8_t*>(t_bounce.Get(pt));
+        auto* bounce = static_cast<uint8_t*>(ThreadBounce(pt));
         if (!bounce) return false;
         MutableSpan b{bounce, pt};
         Error e = SecureContext::Global().opener().Open(
@@ -1234,7 +1106,7 @@ bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
             &HostAeadBackend()) {
             // Path B: device -> pinned host with the copy engine, seal on the
             // CPU. A device backend, when registered, seals in place instead.
-            auto* bounce = static_cast<uint8_t*>(t_bounce.Get(seg.bytes));
+            auto* bounce = static_cast<uint8_t*>(ThreadBounce(seg.bytes));
             if (!bounce) return false;
             size_t off = 0, di = 0;
             std::vector<DevCopy> copies;
@@ -1253,7 +1125,7 @@ bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
     auto& sealer = SecureContext::Global().sealer(Purpose::kTransfer);
     Error e = sealer.Seal(in.data(), in.size(), {aad.data(), aad.size()},
                           {out, out_size}, sealed_len);
-    if (!dev.empty() && t_bounce.host) OPENSSL_cleanse(t_bounce.host, seg.bytes);
+    if (!dev.empty()) CleanseThreadBounce(seg.bytes);
     if (e != Error::kOk) {
         LOG(ERROR) << "secure push: seal failed: " << ToString(e);
         return false;

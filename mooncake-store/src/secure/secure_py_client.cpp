@@ -21,6 +21,7 @@
 
 #include "client_buffer.h"
 #include "device/accelerator_registry.h"
+#include "secure/device_copy.h"
 #include "secure/secure_transport.h"
 
 namespace mooncake {
@@ -36,20 +37,24 @@ int Refuse(const char *what) {
     return Err(ErrorCode::INVALID_PARAMS);
 }
 
-size_t Total(const std::vector<ConstSpan> &v) {
-    size_t t = 0;
-    for (auto &s : v) t += s.size;
-    return t;
+// The store error for a failed seal or open.
+int ErrOf(Error e) {
+    switch (e) {
+        case Error::kOk:
+            return 0;
+        case Error::kBadHeader:
+        case Error::kAuthFailed:
+        case Error::kSizeMismatch:
+        case Error::kUnknownKeyId:
+            return Err(ErrorCode::CHECKSUM_MISMATCH);
+        case Error::kBufferTooSmall:
+            return Err(ErrorCode::NO_AVAILABLE_HANDLE);
+        default:
+            return Err(ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 }  // namespace
-
-std::string SecurePyClient::AssociatedData(const std::string &key) {
-    std::string aad("mooncake-store-object");
-    aad.push_back('\0');
-    aad.append(key);
-    return aad;
-}
 
 bool SecurePyClient::Enabled() { return SecureContext::Global().enabled(); }
 
@@ -59,6 +64,7 @@ SecurePyClient::SecurePyClient(std::shared_ptr<PyClient> inner)
 SecurePyClient::~SecurePyClient() {
     // Staging is registered with the inner client's engine: release it while
     // that engine is still alive.
+    crypto_.reset();
     pool_.reset();
 }
 
@@ -68,13 +74,31 @@ int SecurePyClient::EnsureReady() {
         LOG(ERROR) << "secure mode: not available: " << ctx.reason();
         return Err(ErrorCode::INVALID_PARAMS);
     }
-    if (!pool_ || !client_) return Err(ErrorCode::INVALID_PARAMS);
+    if (!pool_ || !crypto_ || !client_) return Err(ErrorCode::INVALID_PARAMS);
     return 0;
 }
 
-bool SecurePyClient::IsDeviceMemory(const void *p) const {
+bool SecurePyClient::Classify(const void *p, size_t n, const std::string &key,
+                              Buf *out) const {
+    out->data = const_cast<void *>(p);
+    out->size = n;
+    out->device = -1;
+    if (n == 0) return true;
+    if (!p) {
+        LOG(ERROR) << "secure mode: null buffer for key " << key;
+        return false;
+    }
+    // CUDA memory moves through pinned host memory on the copy engine.
+    out->device = DeviceOf(p);
+    if (out->device >= 0) return true;
+    // Other accelerators' memory cannot be read or written by the CPU.
     auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
-    return accelerators.FindDeviceForPointer(p) != nullptr;
+    if (accelerators.FindDeviceForPointer(p) != nullptr) {
+        LOG(ERROR) << "secure mode: key " << key
+                   << " uses non-CUDA device memory, which is not supported";
+        return false;
+    }
+    return true;
 }
 
 int SecurePyClient::SetupInner(const std::function<int()> &setup,
@@ -110,8 +134,12 @@ int SecurePyClient::SetupInner(const std::function<int()> &setup,
             return inner->register_buffer(p, n);
         },
         [inner](void *p) { return inner->unregister_buffer(p); });
+    const auto opt = StoreCryptoOptions::FromEnv(ctx.config());
+    crypto_ = std::make_unique<ObjectCrypto>(opt);
     LOG(INFO) << "secure mode: store client ready (values sealed with "
-              << ToString(ctx.config().algorithm) << ")";
+              << ToString(ctx.config().algorithm) << " in "
+              << opt.segment_bytes << "-byte segments on " << opt.threads
+              << " threads)";
     return 0;
 }
 
@@ -163,29 +191,32 @@ std::vector<int> SecurePyClient::PutMany(const std::vector<std::string> &keys,
                   Err(ErrorCode::INVALID_PARAMS));
         return results;
     }
-    auto &sealer = SecureContext::Global().sealer(Purpose::kStoreObject);
+    // Where each value lives, decided once per piece.
+    std::vector<std::vector<Buf>> bufs(keys.size());
+    std::vector<bool> pending(keys.size(), true);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        for (auto &p : values[i]) {
+            Buf b;
+            if (!Classify(p.data, p.size, keys[i], &b)) {
+                results[i] = Err(ErrorCode::INVALID_PARAMS);
+                pending[i] = false;
+                break;
+            }
+            if (b.size) bufs[i].push_back(b);
+        }
+    }
     size_t i = 0;
     while (i < keys.size()) {
-        // Seal as many values as staging holds, then hand them to the inner
-        // client as one batch.
+        // Take as many values as staging holds, seal them in parallel, then
+        // hand them to the inner client as one batch.
         std::vector<StagingBuffer> held;
-        std::vector<std::string> batch_keys;
-        std::vector<void *> ptrs;
-        std::vector<size_t> sizes;
+        std::vector<ObjectCrypto::SealJob> jobs;
         std::vector<size_t> index;
         for (; i < keys.size(); ++i) {
-            const auto &parts = values[i];
-            bool bad = false;
-            for (auto &p : parts) {
-                if (p.size && (!p.data || IsDeviceMemory(p.data))) bad = true;
-            }
-            if (bad) {
-                LOG(ERROR) << "secure mode: put of key " << keys[i]
-                           << " from device or null memory is not supported";
-                results[i] = Err(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-            const size_t sealed_len = SealedSize(Total(parts));
+            if (!pending[i]) continue;
+            size_t plain = 0;
+            for (auto &b : bufs[i]) plain += b.size;
+            const size_t sealed_len = crypto_->SealedSize(plain);
             StagingBuffer buf = pool_->Allocate(sealed_len);
             if (!buf) {
                 if (!held.empty()) break;  // flush, then retry this key
@@ -194,29 +225,39 @@ std::vector<int> SecurePyClient::PutMany(const std::vector<std::string> &keys,
                 results[i] = Err(ErrorCode::NO_AVAILABLE_HANDLE);
                 continue;
             }
-            const std::string aad = AssociatedData(keys[i]);
-            size_t out_len = 0;
-            Error e = sealer.Seal(parts.data(), parts.size(),
-                                  {aad.data(), aad.size()},
-                                  {buf.data(), buf.size()}, &out_len);
-            if (e != Error::kOk) {
-                LOG(ERROR) << "secure mode: sealing key " << keys[i]
-                           << " failed: " << ToString(e);
-                results[i] = Err(ErrorCode::INTERNAL_ERROR);
-                continue;
-            }
-            batch_keys.push_back(keys[i]);
-            ptrs.push_back(buf.data());
-            sizes.push_back(out_len);
+            ObjectCrypto::SealJob job;
+            job.key = &keys[i];
+            job.in = std::move(bufs[i]);
+            job.out = {buf.data(), sealed_len};
+            jobs.push_back(std::move(job));
             index.push_back(i);
             held.push_back(std::move(buf));
+        }
+        if (jobs.empty()) continue;
+        crypto_->Seal(jobs);
+        std::vector<std::string> batch_keys;
+        std::vector<void *> ptrs;
+        std::vector<size_t> sizes;
+        std::vector<size_t> sent;
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            const size_t k = index[j];
+            if (jobs[j].result != Error::kOk) {
+                LOG(ERROR) << "secure mode: sealing key " << keys[k]
+                           << " failed: " << ToString(jobs[j].result);
+                results[k] = Err(ErrorCode::INTERNAL_ERROR);
+                continue;
+            }
+            batch_keys.push_back(keys[k]);
+            ptrs.push_back(jobs[j].out.data);
+            sizes.push_back(jobs[j].out.size);
+            sent.push_back(k);
         }
         if (batch_keys.empty()) continue;
         auto r = upsert
                      ? inner_->batch_upsert_from(batch_keys, ptrs, sizes, config)
                      : inner_->batch_put_from(batch_keys, ptrs, sizes, config);
-        for (size_t j = 0; j < index.size(); ++j)
-            results[index[j]] =
+        for (size_t j = 0; j < sent.size(); ++j)
+            results[sent[j]] =
                 j < r.size() ? r[j] : Err(ErrorCode::INTERNAL_ERROR);
     }
     return results;
@@ -360,9 +401,9 @@ std::vector<int64_t> SecurePyClient::GetMany(
                   Err(ErrorCode::INVALID_PARAMS));
         return results;
     }
-    auto &opener = SecureContext::Global().opener();
     auto queries = inner_->batch_query(keys);
     std::vector<uint64_t> sealed_sizes(keys.size(), 0);
+    std::vector<std::vector<Buf>> bufs(keys.size());
     std::vector<bool> pending(keys.size(), false);
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i >= queries.size() || !queries[i]) {
@@ -376,28 +417,22 @@ std::vector<int64_t> SecurePyClient::GetMany(
             continue;
         }
         const uint64_t sealed = calculate_total_size(replicas.front());
-        size_t plain = 0;
-        if (!PlaintextSize(sealed, &plain)) {
+        if (sealed < kOverhead) {
             LOG(ERROR) << "secure mode: key " << keys[i]
                        << " is not a sealed object (size " << sealed << ")";
             results[i] = Err(ErrorCode::CHECKSUM_MISMATCH);
             continue;
         }
-        size_t cap = 0;
-        bool bad = false;
+        bool ok = true;
         for (auto &o : outs[i]) {
-            cap += o.size;
-            if (o.size && (!o.data || IsDeviceMemory(o.data))) bad = true;
+            Buf b;
+            if (!Classify(o.data, o.size, keys[i], &b)) {
+                ok = false;
+                break;
+            }
+            if (b.size) bufs[i].push_back(b);
         }
-        if (bad) {
-            LOG(ERROR) << "secure mode: get of key " << keys[i]
-                       << " into device or null memory is not supported";
-            results[i] = Err(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        if (cap < plain) {
-            LOG(ERROR) << "secure mode: buffer too small for key " << keys[i]
-                       << ": required=" << plain << ", available=" << cap;
+        if (!ok) {
             results[i] = Err(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -428,6 +463,8 @@ std::vector<int64_t> SecurePyClient::GetMany(
         }
         if (batch_keys.empty()) continue;
         auto r = inner_->batch_get_into(batch_keys, ptrs, sizes);
+        std::vector<ObjectCrypto::OpenJob> jobs;
+        std::vector<size_t> opened;
         for (size_t j = 0; j < index.size(); ++j) {
             const size_t k = index[j];
             const int64_t got = j < r.size() ? r[j] : -1;
@@ -435,33 +472,47 @@ std::vector<int64_t> SecurePyClient::GetMany(
                 results[k] = got;
                 continue;
             }
-            if (static_cast<uint64_t>(got) != sealed_sizes[k]) {
-                // The object changed size between query and read.
+            ObjectCrypto::OpenJob job;
+            // The header is copied out once; nothing below re-reads it from
+            // staging.
+            if (static_cast<uint64_t>(got) != sealed_sizes[k] ||
+                !ParseObject({held[j].data(), sealed_sizes[k]},
+                             sealed_sizes[k], &job.layout)) {
+                // Not a sealed object, or it changed size between query and
+                // read.
+                LOG(ERROR) << "secure mode: key " << keys[k]
+                           << " is not a well-formed sealed object";
                 results[k] = Err(ErrorCode::CHECKSUM_MISMATCH);
                 continue;
             }
-            // Decrypt into exactly the plaintext's length of the caller's
+            // Open into exactly the plaintext's length of the caller's
             // buffers.
-            size_t plain = sealed_sizes[k] - kOverhead;
-            Outs trimmed;
-            for (auto &o : outs[k]) {
+            uint64_t plain = job.layout.plaintext_len;
+            for (auto &b : bufs[k]) {
                 if (plain == 0) break;
-                size_t n = std::min(plain, o.size);
-                trimmed.push_back({o.data, n});
+                const size_t n = static_cast<size_t>(
+                    std::min<uint64_t>(plain, b.size));
+                job.out.push_back({b.data, n, b.device});
                 plain -= n;
             }
-            const std::string aad = AssociatedData(keys[k]);
-            Error e = opener.Open({held[j].data(), sealed_sizes[k]},
-                                  Purpose::kStoreObject,
-                                  {aad.data(), aad.size()}, trimmed.data(),
-                                  trimmed.size());
-            if (e != Error::kOk) {
-                LOG(ERROR) << "secure mode: key " << keys[k]
-                           << " failed to open: " << ToString(e);
-                results[k] = Err(ErrorCode::CHECKSUM_MISMATCH);
+            if (plain != 0) {
+                LOG(ERROR) << "secure mode: buffer too small for key "
+                           << keys[k]
+                           << ": required=" << job.layout.plaintext_len;
+                results[k] = Err(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            results[k] = static_cast<int64_t>(sealed_sizes[k] - kOverhead);
+            job.key = &keys[k];
+            job.sealed = {held[j].data(), sealed_sizes[k]};
+            jobs.push_back(std::move(job));
+            opened.push_back(k);
+        }
+        crypto_->Open(jobs);
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            results[opened[j]] =
+                jobs[j].result == Error::kOk
+                    ? static_cast<int64_t>(jobs[j].layout.plaintext_len)
+                    : ErrOf(jobs[j].result);
         }
     }
     return results;
@@ -505,12 +556,26 @@ std::vector<int> SecurePyClient::batch_get_into_multi_buffers(
 }
 
 int64_t SecurePyClient::getSize(const std::string &key) {
+    if (int rc = EnsureReady()) return rc;
     int64_t s = inner_->getSize(key);
     if (s < 0) return s;
-    size_t plain = 0;
-    if (!PlaintextSize(static_cast<size_t>(s), &plain))
+    if (static_cast<uint64_t>(s) < kOverhead)
         return Err(ErrorCode::CHECKSUM_MISMATCH);
-    return static_cast<int64_t>(plain);
+    // The plaintext size is in the object's header: read just that. It is
+    // not authenticated here (a get authenticates it).
+    const size_t n = std::min<size_t>(static_cast<size_t>(s), kHeaderSize);
+    StagingBuffer buf = pool_->Allocate(n);
+    if (!buf) return Err(ErrorCode::NO_AVAILABLE_HANDLE);
+    auto r = inner_->get_into_ranges({buf.data()}, {{key}}, {{{0}}}, {{{0}}},
+                                     {{{n}}}, nullptr);
+    if (r.size() != 1 || r[0].size() != 1 || r[0][0].size() != 1)
+        return Err(ErrorCode::INTERNAL_ERROR);
+    if (r[0][0][0] < 0) return r[0][0][0];
+    ObjectLayout layout;
+    if (static_cast<size_t>(r[0][0][0]) != n ||
+        !ParseObject({buf.data(), n}, static_cast<size_t>(s), &layout))
+        return Err(ErrorCode::CHECKSUM_MISMATCH);
+    return static_cast<int64_t>(layout.plaintext_len);
 }
 
 // --------------------------------------------------------------- refused --
@@ -617,6 +682,7 @@ std::vector<std::string> SecurePyClient::batch_replica_clear(
     return inner_->batch_replica_clear(keys, segment_name);
 }
 int SecurePyClient::tearDownAll() {
+    crypto_.reset();
     pool_.reset();
     return inner_->tearDownAll();
 }

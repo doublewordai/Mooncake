@@ -547,7 +547,8 @@ if(STORE_USE_K8S_LEASE)
 endif()
 
 if(WITH_SECURE_KV)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES secure/secure_py_client.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES secure/secure_py_client.cpp
+       secure/sealed_object.cpp)
 endif()
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT

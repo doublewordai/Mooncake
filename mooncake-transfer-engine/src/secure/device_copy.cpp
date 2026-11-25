@@ -16,10 +16,18 @@
 
 #include <glog/logging.h>
 #include <openssl/crypto.h>
+#include <sched.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <fstream>
 #include <map>
+#include <string>
+
+#include "secure/secure_push.h"
+#include "secure/staging_pool.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -104,6 +112,48 @@ int DeviceOf(const void* p) {
     (void)p;
 #endif
     return -1;
+}
+
+int HomeNumaNode(const void* p) {
+    if (!p) return -1;
+#ifdef USE_CUDA
+    const int dev = DeviceOf(p);
+    if (dev >= 0) {
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, sizeof(bus), dev) != cudaSuccess) {
+            cudaGetLastError();
+            return -1;
+        }
+        for (char* c = bus; *c; ++c)
+            *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+        int node = -1;
+        std::ifstream(std::string("/sys/bus/pci/devices/") + bus +
+                      "/numa_node") >>
+            node;
+        return node;
+    }
+#endif
+    return NodeOfPage(p);
+}
+
+std::vector<int> NumaNodeCpus(int node) {
+    std::vector<int> out;
+    if (node < 0) return out;
+    std::string list;
+    std::ifstream("/sys/devices/system/node/node" + std::to_string(node) +
+                  "/cpulist") >>
+        list;
+    std::vector<int> all;
+    if (list.empty() || !ParseCpuList(list, &all)) return out;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    // The process's mask (its main thread's), not the calling thread's.
+    if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0)
+        return out;
+    for (int c : all)
+        if (c >= 0 && c < CPU_SETSIZE && CPU_ISSET(c, &allowed))
+            out.push_back(c);
+    return out;
 }
 
 void* ThreadBounce(size_t n) { return t_bounce.Get(n); }

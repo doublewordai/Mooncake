@@ -42,6 +42,15 @@ namespace secure {
 // host-accessible memory.
 int DeviceOf(const void* p);
 
+// The NUMA node a push of memory at `p` should stage on: for device memory,
+// the node its GPU hangs off (the node whose NIC the engine uses for that
+// GPU's memory); for host memory, the node holding its page. -1 if unknown.
+int HomeNumaNode(const void* p);
+
+// CPUs of NUMA node `node` this process may run on (its affinity mask), in
+// order. Empty if unknown or none.
+std::vector<int> NumaNodeCpus(int node);
+
 // This thread's pinned host bounce buffer, at least `n` bytes (grown on
 // demand; plain heap memory if pinning fails). nullptr on failure. Cleansed
 // and freed when the thread exits.

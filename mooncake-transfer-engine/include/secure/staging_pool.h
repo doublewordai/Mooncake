@@ -16,7 +16,8 @@
 // (besides store segments) that is registered with the NIC, and so the only
 // memory peers can read or write. It only ever holds sealed messages.
 //
-// Regions are anonymous host mappings (populated up front), registered through
+// Regions are anonymous host mappings (populated up front, on a chosen NUMA
+// node when one is set: see MapOnNode), registered through
 // a caller-supplied function that must register them as ciphertext memory
 // (inside a CiphertextRegistrationScope). Allocation is first-fit with
 // coalescing, 64-byte aligned, thread safe; new regions are added on demand
@@ -39,6 +40,16 @@ namespace mooncake {
 namespace secure {
 
 class StagingPool;
+
+// Maps `n` bytes of anonymous memory and populates it on NUMA node `node`
+// (node < 0: wherever the calling thread's policy puts it). Placement asks
+// the kernel (mbind, preferred) and also faults the pages in from a thread
+// running on `cpus` (the node's CPUs), so first touch lands them there even
+// where mbind is not permitted. nullptr on failure.
+void* MapOnNode(size_t n, int node, const std::vector<int>& cpus);
+
+// NUMA node holding the (faulted-in) page at `p`, or -1 if unknown.
+int NodeOfPage(const void* p);
 
 // A block of staging memory; returned to the pool when destroyed.
 class StagingBuffer {
@@ -92,6 +103,9 @@ class StagingPool {
     bool Contains(const void* p, size_t n) const;
 
     size_t region_bytes() const { return region_bytes_; }
+    // Regions added from now on are placed on `node` (faulted in from
+    // `cpus`); node < 0: no placement.
+    void set_numa_node(int node, std::vector<int> cpus);
     size_t mapped_bytes() const;
     size_t free_bytes() const;
 
@@ -107,6 +121,8 @@ class StagingPool {
 
     const size_t region_bytes_;
     const size_t max_bytes_;
+    int node_ = -1;
+    std::vector<int> node_cpus_;
     RegisterFn reg_;
     UnregisterFn unreg_;
     mutable std::mutex mu_;

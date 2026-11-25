@@ -84,6 +84,10 @@
 #include "secure/staging_pool.h"
 #include "transport/transport.h"
 
+// Hidden: each module that links this (engine.so, _store.so) keeps its own
+// copy of the secure code and its state (SECURE_KV.md, "One copy per module").
+#pragma GCC visibility push(hidden)
+
 namespace mooncake {
 namespace secure {
 
@@ -298,3 +302,5 @@ class SecurePushService {
 
 }  // namespace secure
 }  // namespace mooncake
+
+#pragma GCC visibility pop

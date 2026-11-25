@@ -81,6 +81,27 @@ value) never falls back to plaintext: the transfer engine refuses to install
 transports, servers that would serve RPC abort, and the control plane makes
 and accepts no tags.
 
+## One copy per module
+
+The Python modules `engine.so` (vLLM's P2P connector) and `_store*.so` (its
+store connector) each link the transfer engine and the secure code
+statically, and a prefill worker loads both. Secure mode keeps process-wide
+state (the key ring and sealers, control-auth's key and replay cache, the
+handshake framing hook and the push endpoints it carries), so every secure
+symbol, and the hook in `common.h`, has hidden visibility: each module keeps
+its own copy, used only by the transfer engines that module creates. Default
+visibility would let the dynamic linker merge some of that state across
+modules (an `inline` variable becomes `STB_GNU_UNIQUE`, one per process) or
+bind one module's calls to the other's, and a handshake read through one
+module's hook would record a peer's push endpoint where the other module's
+sender never looks. Each copy reads the same switch and key, and its seals
+use their own random salts, so two copies interoperate like two processes.
+For the same reason a secure build needs `BUILD_SHARED_LIBS=OFF`.
+[`tests/check_module_isolation.py`](tests/check_module_isolation.py) checks
+a secure build's modules export no secure symbol;
+[`tests/two_module_p2d_test.py`](tests/two_module_p2d_test.py) pushes from a
+process that has loaded both.
+
 ## Secure push discovery and control limits
 
 A sender finds a receiver's push control endpoint in the receiver's segment

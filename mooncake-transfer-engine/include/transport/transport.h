@@ -40,7 +40,7 @@ class RdmaEndPoint;
 class TransferMetadata;
 #ifdef WITH_SECURE_KV
 namespace secure {
-class SecureTransport;
+class [[gnu::visibility("hidden")]] SecureTransport;  // as in secure/
 }
 #endif
 /// By default, these functions return 0 (or non-null pointer) on success and

@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+// Hidden: each module that links this (engine.so, _store.so) keeps its own
+// copy of the secure code and its state (SECURE_KV.md, "One copy per module").
+#pragma GCC visibility push(hidden)
+
 namespace mooncake {
 namespace secure_env {
 
@@ -72,3 +76,5 @@ KeyError ParseKeyMaterial(const std::string& text, Key* out);
 
 }  // namespace secure_env
 }  // namespace mooncake
+
+#pragma GCC visibility pop

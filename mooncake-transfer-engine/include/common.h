@@ -539,11 +539,16 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
 
 // Replaces the handshake framing below when set. Installed once, when a
 // TransferMetadata is created, by a -DWITH_SECURE_KV=ON build in secure mode
-// (src/secure/); null otherwise.
+// (src/secure/); null otherwise. Hidden there, so each module that links the
+// transfer engine keeps its own hook into its own copy of src/secure/
+// (SECURE_KV.md, "One copy per module").
 struct HandshakeFramingHook {
     int (*write)(int fd, HandShakeRequestType type, const std::string &str);
     std::pair<HandShakeRequestType, std::string> (*read)(int fd);
 };
+#ifdef WITH_SECURE_KV
+[[gnu::visibility("hidden")]]
+#endif
 inline const HandshakeFramingHook *g_handshake_framing_hook = nullptr;
 
 static inline int writeString(int fd, const HandShakeRequestType type,

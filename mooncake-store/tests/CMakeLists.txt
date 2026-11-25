@@ -528,4 +528,7 @@ add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
 
 if(WITH_SECURE_KV)
   add_store_test(secure_store_test secure/secure_store_test.cpp)
+  if(USE_CUDA)
+    target_link_libraries(secure_store_test PRIVATE CUDA::cudart)
+  endif()
 endif()

@@ -16,13 +16,16 @@
 // mode is on (WITH_SECURE_KV build, MC_SECURE_MODE=1). Built only with
 // WITH_SECURE_KV.
 //
-//  * Put: the value is sealed (AEAD, object key bound as associated data)
-//    into engine staging and the sealed bytes are what the inner client
-//    stores, on whatever path it picks (local memcpy, RDMA, disk). Sizes sent
-//    to the master are the sealed sizes.
-//  * Get: the sealed object is fetched into staging, verified and decrypted
-//    into the caller's buffer in one pass; a tag failure is a per-key
-//    CHECKSUM_MISMATCH and leaves the caller's buffer zeroed.
+//  * Put: the value, from host or GPU memory, is sealed into engine staging
+//    as a sealed object (secure/sealed_object.h: independently authenticated
+//    segments, sealed in parallel; GPU memory reaches the CPU through pinned
+//    host memory on the copy engine), and the sealed bytes are what the inner
+//    client stores, on whatever path it picks (local memcpy, RDMA, disk).
+//    Sizes sent to the master are the sealed sizes.
+//  * Get: the sealed object is fetched into staging and every segment is
+//    verified before the caller sees any of it; a failure is a per-key
+//    CHECKSUM_MISMATCH that leaves a host buffer zeroed and GPU memory
+//    untouched.
 //  * Everything else that moves object bytes (ranged reads and writes,
 //    sessions, get_buffer, put_from_with_metadata, dummy/shm modes, offload)
 //    is refused with INVALID_PARAMS: it cannot be authenticated as a whole
@@ -42,6 +45,7 @@
 
 #include "pyclient.h"
 #include "secure/kv_crypto.h"
+#include "secure/sealed_object.h"
 #include "secure/staging_pool.h"
 
 namespace mooncake {
@@ -190,13 +194,17 @@ class SecurePyClient final : public PyClient {
 
     // For tests and diagnostics.
     StagingPool *staging() const { return pool_.get(); }
-
-    // The object-key associated data bound into every sealed store value.
-    static std::string AssociatedData(const std::string &key);
+    ObjectCrypto *crypto() const { return crypto_.get(); }
 
    private:
     using Parts = std::vector<ConstSpan>;
     using Outs = std::vector<MutableSpan>;
+
+    // Where the caller's [p, p+n) lives: false (and an error logged) if it
+    // cannot be sealed from or opened into (null, or device memory that is
+    // not CUDA).
+    bool Classify(const void *p, size_t n, const std::string &key,
+                  Buf *out) const;
 
     int EnsureReady();
     std::vector<int> PutMany(const std::vector<std::string> &keys,
@@ -204,10 +212,10 @@ class SecurePyClient final : public PyClient {
                              const ReplicateConfig &config, bool upsert);
     std::vector<int64_t> GetMany(const std::vector<std::string> &keys,
                                  const std::vector<Outs> &outs);
-    bool IsDeviceMemory(const void *p) const;
 
     std::shared_ptr<PyClient> inner_;
     std::unique_ptr<StagingPool> pool_;
+    std::unique_ptr<ObjectCrypto> crypto_;
     std::mutex setup_mu_;
 };
 

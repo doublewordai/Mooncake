@@ -83,8 +83,16 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    ApplyRpcTimeoutOverrides(config.client_config,
-                             RpcTimeoutConfig::FromEnvironment());
+    const auto overrides = RpcTimeoutConfig::FromEnvironment();
+    ApplyRpcTimeoutOverrides(config.client_config, overrides);
+    if (!ha_enabled) {
+        if (overrides.connect_retries) {
+            config.connect_retry_count = *overrides.connect_retries;
+        }
+        if (overrides.reconnect_wait) {
+            config.reconnect_wait_time = *overrides.reconnect_wait;
+        }
+    }
     return config;
 }
 

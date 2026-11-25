@@ -14,7 +14,8 @@ namespace mooncake {
 // Snapshot object store type enumeration
 enum class SnapshotObjectStoreType {
     LOCAL_FILE = 0,  // Local file system
-    S3 = 1           // S3 storage
+    S3 = 1,          // S3 storage
+    PEER = 2         // Local file system, served to and fetched from peers
 };
 
 struct SnapshotObjectInspection {
@@ -40,6 +41,9 @@ inline SnapshotObjectStoreType ParseSnapshotObjectStoreType(
     if (type_str == "local" || type_str == "LOCAL") {
         return SnapshotObjectStoreType::LOCAL_FILE;
     }
+    if (type_str == "peer" || type_str == "PEER") {
+        return SnapshotObjectStoreType::PEER;
+    }
 
     // Unknown object store type - fail fast.
     throw std::invalid_argument("Unknown snapshot object store type: '" +
@@ -54,6 +58,8 @@ inline std::string SnapshotObjectStoreTypeToString(
             return "s3";
         case SnapshotObjectStoreType::LOCAL_FILE:
             return "local";
+        case SnapshotObjectStoreType::PEER:
+            return "peer";
         default:
             throw std::invalid_argument("Unknown SnapshotObjectStoreType: " +
                                         std::to_string(static_cast<int>(type)));
@@ -142,13 +148,26 @@ class SnapshotObjectStore {
     }
 
     /**
+     * @brief Whether the OpLog may be pruned behind the snapshot whose
+     * artifacts live under `artifact_prefix`, i.e. a standby that starts with
+     * no local state can still read it. A store every reader shares always
+     * can; a store whose objects live on the masters themselves says so only
+     * once enough live masters hold the snapshot.
+     */
+    virtual bool RetainedForPruning(const std::string& artifact_prefix) {
+        (void)artifact_prefix;
+        return true;
+    }
+
+    /**
      * @brief Get connection/configuration info (for logging)
      * @return Connection info string
      */
     virtual std::string GetConnectionInfo() const = 0;
 
     /**
-     * @brief Factory method: create object store instance by type
+     * @brief Factory method: create object store instance by type (PEER
+     * needs the HA backend: CreatePeerSnapshotObjectStore)
      * @param type Object store type
      * @return Smart pointer to object store instance
      */

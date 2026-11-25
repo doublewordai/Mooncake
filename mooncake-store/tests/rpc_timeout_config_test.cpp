@@ -7,7 +7,9 @@
 #include <optional>
 #include <string>
 
+#include "common/network.h"
 #include "config/rpc_timeout_config.h"
+#include "master_client.h"
 
 namespace mooncake {
 namespace {
@@ -100,6 +102,33 @@ TEST_F(RpcTimeoutConfigTest, EachConstructionReadsCurrentEnvironment) {
     EXPECT_FALSE(cleared.connect_timeout.has_value());
     EXPECT_EQ(original.request_timeout, std::chrono::milliseconds(1500));
     EXPECT_EQ(original.connect_timeout, std::chrono::milliseconds(1000));
+}
+
+// A store client whose leader has gone keeps calling the old address until the
+// HA monitor moves it. With the pool's default schedule each such call spends
+// four connect attempts a second apart before failing; the overrides bound it
+// to one attempt, so the call fails, and the next one reaches the new leader,
+// within the connect timeout.
+TEST(MasterForegroundReconnectTest, RetryOverrideBoundsAFailedConnect) {
+    const auto ports = getFreeTcpPorts(1);
+    ASSERT_EQ(1u, ports.size());
+    const std::string nobody = "127.0.0.1:" + std::to_string(ports[0]);
+    const auto connect_ms = [&] {
+        MasterClient client(UUID{1, 2});
+        const auto start = std::chrono::steady_clock::now();
+        EXPECT_NE(ErrorCode::OK, client.Connect(nobody));
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    ASSERT_EQ(setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1000", 1), 0);
+    ASSERT_EQ(setenv("MC_RPC_CONNECT_RETRIES", "0", 1), 0);
+    ASSERT_EQ(setenv("MC_RPC_RECONNECT_WAIT_MS", "0", 1), 0);
+    EXPECT_LT(connect_ms(), 1000);
+    ASSERT_EQ(unsetenv("MC_RPC_CONNECT_RETRIES"), 0);
+    ASSERT_EQ(unsetenv("MC_RPC_RECONNECT_WAIT_MS"), 0);
+    EXPECT_GE(connect_ms(), 3000);  // the default schedule it replaces
+    ASSERT_EQ(unsetenv("MC_RPC_CONNECT_TIMEOUT_MS"), 0);
 }
 
 }  // namespace

@@ -9,8 +9,8 @@ not trusted. It has two halves that share one switch and one key:
   or the store is sealed with an AEAD and verified before use.
 - **Control plane** (`control_auth`, `handshake_auth`, the store's
   `rpc_auth`): every P2P handshake message and every store coro_rpc request
-  carries an HMAC tag; untagged, forged, stale or replayed messages are
-  refused.
+  carries an HMAC tag (an RPC's covers its route key and arguments);
+  untagged, forged, stale or replayed messages are refused.
 
 The code lives in `src/secure/` directories (and `include/secure/`) and is
 compiled only with `-DWITH_SECURE_KV=ON` (needs OpenSSL libcrypto). With the
@@ -107,6 +107,11 @@ in total) separately from authenticated ones. Both are described, with their
   `get_buffer` (and so the bytes-returning `get`), `put_from_with_metadata`,
   dummy/shm modes, offload. These return `INVALID_PARAMS`; use
   `put_from`/`get_into` and their batch forms. Metadata calls are forwarded.
+- Store entry points that do not go through that decorator: the store C API
+  (and so the Rust and Go bindings over it) creates no client, the standalone
+  `mooncake_client` exits 78, and a `RealClient` set up anywhere but inside
+  the decorator refuses setup
+  ([`mooncake-store/include/secure/entry_guard.h`](../../../mooncake-store/include/secure/entry_guard.h)).
 - Store RPCs and handshakes without a valid, fresh, unreplayed tag (answered
   with code 401 / dropped).
 

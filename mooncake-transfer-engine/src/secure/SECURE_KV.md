@@ -89,8 +89,9 @@ and accepts no tags.
   push that completes only after the peer has verified and decrypted it.
 - In the store's Python client, every call that moves object bytes and cannot
   be authenticated as a whole object: ranged reads/writes, sessions,
-  `get_buffer`, `put_from_with_metadata`, dummy/shm modes, offload. These
-  return `INVALID_PARAMS`. Metadata calls are forwarded.
+  `get_buffer` (and so the bytes-returning `get`), `put_from_with_metadata`,
+  dummy/shm modes, offload. These return `INVALID_PARAMS`; use
+  `put_from`/`get_into` and their batch forms. Metadata calls are forwarded.
 - Store RPCs and handshakes without a valid, fresh, unreplayed tag (answered
   with code 401 / dropped).
 

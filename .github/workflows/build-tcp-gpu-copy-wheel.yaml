@@ -1,0 +1,89 @@
+# Test-only: build the CUDA 13 / Python 3.12 x86_64 wheel of the TCP GPU-copy fix (fix/tcp-gpu-copy-nonblocking) so
+# vLLM research workers can try it through the model layer's MOONCAKE_CLIENT. Publishes nothing; the wheel is a run
+# artifact. The unit-tests job compiles the touched test and binaries (the GPU cases skip on runners without a GPU).
+name: Build tcp-gpu-copy wheel (test only)
+on:
+  push:
+    branches: [fix/tcp-gpu-copy-nonblocking-build]
+permissions:
+  contents: read
+jobs:
+  wheel:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-tcp-gpu-copy
+      version-override: 0.3.14+tcpgpucopy1
+
+  unit-tests:
+    name: Touched tests (tcp transport, CUDA staging)
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    # Same configuration as ci.yml's unit-tests job.
+    - name: Configure project with unit tests
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DUSE_HTTP=ON \
+          -DUSE_CXL=ON \
+          -DUSE_UB=ON \
+          -DUSE_ETCD=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
+          -DWITH_P2P_STORE=ON \
+          -DWITH_CONDUCTOR=ON \
+          -DSTORE_USE_ETCD=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Configure CUDA driver runtime
+      uses: ./.github/actions/setup-cuda-runtime
+
+    - name: Build the touched tests and binaries
+      run: |
+        cmake --build build --parallel 128 --target tcp_cuda_staging_test mooncake_client
+      shell: bash
+
+    - name: Run the touched tests
+      run: |
+        ctest --test-dir build --output-on-failure --no-tests=error -R '^tcp_cuda_staging_test$'
+      shell: bash

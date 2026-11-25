@@ -13,7 +13,8 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 # Data path: KV crypto, the secure transport decorator, the staging pool and
 # the secure P->D push. Compiled into transfer_engine (see ../CMakeLists.txt).
 add_library(mooncake_secure OBJECT kv_crypto.cpp secure_transport.cpp
-                                   staging_pool.cpp secure_push.cpp)
+                                   staging_pool.cpp secure_push.cpp
+                                   stage_stats.cpp)
 set_target_properties(mooncake_secure PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Device <-> pinned host copies shared by the push and the store client.
 target_sources(mooncake_secure PRIVATE device_copy.cpp)

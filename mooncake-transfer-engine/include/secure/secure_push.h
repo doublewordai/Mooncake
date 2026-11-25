@@ -81,6 +81,7 @@
 #include <vector>
 
 #include "secure/kv_crypto.h"
+#include "secure/stage_stats.h"
 #include "secure/staging_pool.h"
 #include "transport/transport.h"
 
@@ -210,19 +211,6 @@ enum class PushStage : int {
 };
 const char* PushStageName(PushStage s);
 
-// Bucket b of a stage histogram counts durations in [2^(b-1), 2^b)
-// microseconds (bucket 0: under 1 us; the last: everything longer).
-constexpr int kStageBuckets = 24;
-
-struct StageStats {
-    uint64_t count = 0;
-    uint64_t sum_ns = 0;
-    uint64_t max_ns = 0;
-    uint64_t buckets[kStageBuckets] = {};
-    // Upper bound (us) of the bucket holding quantile q (0..1); 0 if empty.
-    uint64_t QuantileUpperUs(double q) const;
-};
-
 // Cumulative since the service started.
 struct PushStats {
     StageStats stage[static_cast<int>(PushStage::kCount)];
@@ -244,9 +232,12 @@ class CryptoPool {
                const char* name, bool each = true);
     ~CryptoPool();
     void Run(std::function<void()> fn);
+    // Re-pins every thread (before its next task).
+    void SetCpus(std::vector<int> cpus, bool each);
 
    private:
     void Loop(size_t index);
+    void Pin(size_t index);
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<std::function<void()>> queue_;
@@ -254,6 +245,7 @@ class CryptoPool {
     std::vector<std::thread> threads_;
     std::vector<int> cpus_;
     bool each_ = true;
+    uint64_t cpus_gen_ = 0;  // bumped by SetCpus
 };
 
 // What the service needs from the transport it lives in. Kept as callbacks so

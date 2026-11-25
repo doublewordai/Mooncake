@@ -22,6 +22,8 @@
 
 #include "error.h"
 #include "memory_location.h"
+#include "secure/device_copy.h"
+#include "secure/staging_pool.h"
 #include "secure/kv_crypto.h"
 
 namespace mooncake {
@@ -29,16 +31,35 @@ namespace secure {
 
 namespace {
 thread_local int g_ciphertext_scope_depth = 0;
-}
+thread_local int g_ciphertext_home_node = -1;
 
-CiphertextRegistrationScope::CiphertextRegistrationScope() {
+// Where ciphertext memory registered at `location` should go: "cpu:<home>"
+// for host memory registered without a location inside a scope with a home
+// node (moved there first), else `location` unchanged.
+std::string HomeLocation(void* addr, size_t length,
+                         const std::string& location) {
+    const int node = CiphertextRegistrationScope::HomeNode();
+    if (node < 0 || location != kWildcardLocation || DeviceOf(addr) >= 0)
+        return location;
+    PlacePagesOnNode(addr, length, node);
+    return "cpu:" + std::to_string(node);
+}
+}  // namespace
+
+CiphertextRegistrationScope::CiphertextRegistrationScope(int home_node)
+    : saved_node_(g_ciphertext_home_node) {
     ++g_ciphertext_scope_depth;
+    if (home_node >= 0) g_ciphertext_home_node = home_node;
 }
 CiphertextRegistrationScope::~CiphertextRegistrationScope() {
     --g_ciphertext_scope_depth;
+    g_ciphertext_home_node = saved_node_;
 }
 bool CiphertextRegistrationScope::Active() {
     return g_ciphertext_scope_depth > 0;
+}
+int CiphertextRegistrationScope::HomeNode() {
+    return g_ciphertext_scope_depth > 0 ? g_ciphertext_home_node : -1;
 }
 
 SecureTransport::SecureTransport(Transport* inner) : inner_(inner) {}
@@ -54,15 +75,9 @@ int SecureTransport::install(std::string& local_server_name,
     if (rc) return rc;
     PushFabric f;
     f.register_ciphertext = [this](void* p, size_t n, int node) {
-        CiphertextRegistrationScope scope;
-        // Named by node, the engine registers it on that node's NIC (the
-        // one it uses for the GPU on that node) even if some pages landed
-        // elsewhere; a node it has no NIC entry for falls back to where the
-        // memory is.
-        if (node >= 0 &&
-            registerLocalMemory(p, n, "cpu:" + std::to_string(node), true,
-                                true) == 0)
-            return 0;
+        // Registered as the node's memory, so on that node's NIC (the one
+        // the engine uses for the GPU on that node).
+        CiphertextRegistrationScope scope(node);
         return registerLocalMemory(p, n, kWildcardLocation, true, true);
     };
     f.unregister = [this](void* p) { return unregisterLocalMemory(p, true); };
@@ -374,7 +389,13 @@ int SecureTransport::registerLocalMemory(void* addr, size_t length,
                                          bool update_metadata) {
     const bool nic = CiphertextRegistrationScope::Active();
     if (nic) {
-        int rc = inner_->registerLocalMemory(addr, length, location,
+        const std::string where = HomeLocation(addr, length, location);
+        int rc = inner_->registerLocalMemory(addr, length, where,
+                                             remote_accessible,
+                                             update_metadata);
+        // A node the engine has no NIC entry for: where the memory is.
+        if (rc && where != location)
+            rc = inner_->registerLocalMemory(addr, length, location,
                                              remote_accessible,
                                              update_metadata);
         if (rc) return rc;
@@ -420,7 +441,28 @@ int SecureTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     const bool nic = CiphertextRegistrationScope::Active();
     if (nic) {
-        int rc = inner_->registerLocalMemoryBatch(buffer_list, location);
+        int rc = -1;
+        if (CiphertextRegistrationScope::HomeNode() >= 0 &&
+            location == kWildcardLocation) {
+            // One at a time, each placed on the home node.
+            size_t done = 0;
+            for (; done < buffer_list.size(); ++done) {
+                const auto& b = buffer_list[done];
+                const std::string where = HomeLocation(b.addr, b.length, location);
+                int r = inner_->registerLocalMemory(b.addr, b.length, where,
+                                                    true, true);
+                if (r && where != location)
+                    r = inner_->registerLocalMemory(b.addr, b.length, location,
+                                                    true, true);
+                if (r) break;
+            }
+            rc = done == buffer_list.size() ? 0 : -1;
+            if (rc)
+                for (size_t i = 0; i < done; ++i)
+                    inner_->unregisterLocalMemory(buffer_list[i].addr, true);
+        } else {
+            rc = inner_->registerLocalMemoryBatch(buffer_list, location);
+        }
         if (rc) return rc;
     }
     {

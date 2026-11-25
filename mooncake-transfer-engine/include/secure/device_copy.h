@@ -47,6 +47,11 @@ int DeviceOf(const void* p);
 // GPU's memory); for host memory, the node holding its page. -1 if unknown.
 int HomeNumaNode(const void* p);
 
+// The NUMA node CUDA device `dev` hangs off (-1 if unknown), and that of the
+// calling thread's current device.
+int GpuNumaNode(int dev);
+int CurrentGpuNumaNode();
+
 // CPUs of NUMA node `node` this process may run on (its affinity mask), in
 // order. Empty if unknown or none.
 std::vector<int> NumaNodeCpus(int node);

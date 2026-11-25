@@ -646,6 +646,33 @@ TEST_F(SecurePushTest, StageTimingsCoverEverySegment) {
     EXPECT_NE(tx1.ToString().find("seal{n="), std::string::npos);
 }
 
+// Ciphertext memory registered inside a scope with a home node lands on that
+// node (its pages, and so the NIC the engine picks for it), on every node
+// this process may run on.
+TEST_F(SecurePushTest, CiphertextRegisteredInAHomeScopeLandsOnTheHomeNode) {
+    constexpr size_t n = 4 << 20;
+    int checked = 0;
+    for (int node = 0; node < 64; ++node) {
+        if (NumaNodeCpus(node).empty()) continue;
+        void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(p, MAP_FAILED);
+        {
+            CiphertextRegistrationScope scope(node);
+            ASSERT_EQ(A().engine->registerLocalMemory(p, n), 0);
+        }
+        memset(p, 1, n);
+        const int got = NodeOfPage(static_cast<char*>(p) + n / 2);
+        EXPECT_TRUE(A().xport->IsCiphertextMemory(p, n));
+        A().engine->unregisterLocalMemory(p);
+        munmap(p, n);
+        if (got < 0) GTEST_SKIP() << "get_mempolicy unavailable here";
+        EXPECT_EQ(got, node);
+        ++checked;
+    }
+    EXPECT_GT(checked, 0);
+}
+
 TEST_F(SecurePushTest, RetryUsesFreshNoncesAndTransferId) {
     Buf src(A(), 1 << 18, 0x66);
     Buf dst(B(), 1 << 18, 0);

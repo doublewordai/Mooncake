@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -64,6 +65,9 @@ class SecurePyClient final : public PyClient {
 
     // Secure mode is on for this process (the construction-time switch).
     static bool Enabled();
+
+    // Stage timings of this client's puts and gets, cumulative.
+    StoreStats store_stats() const;
 
     // Runs the inner client's setup (`setup`, returning 0 on success) inside a
     // CiphertextRegistrationScope, then readies staging. Refuses a
@@ -218,10 +222,18 @@ class SecurePyClient final : public PyClient {
     std::vector<int64_t> GetMany(const std::vector<std::string> &keys,
                                  const std::vector<Outs> &outs);
 
+    void MaybeLogStats();
+
     std::shared_ptr<PyClient> inner_;
     std::unique_ptr<StagingPool> pool_;
     std::unique_ptr<ObjectCrypto> crypto_;
     std::mutex setup_mu_;
+    StoreCryptoOptions opt_;
+    StageRecorder stages_{static_cast<size_t>(StoreStage::kCount)};
+    // Home NUMA node (-1: none); in auto mode, the first registered buffer
+    // with a known node may move it once.
+    std::atomic<int> home_node_{-1};
+    bool home_from_buffer_ = false;
 };
 
 }  // namespace secure

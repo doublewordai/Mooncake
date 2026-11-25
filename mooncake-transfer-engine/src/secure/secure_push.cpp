@@ -448,6 +448,38 @@ bool ParseCpuList(const std::string& text, std::vector<int>* out) {
     return true;
 }
 
+std::vector<std::pair<size_t, size_t>> PlanPushSegments(size_t total,
+                                                        size_t segment_bytes,
+                                                        size_t first_bytes,
+                                                        size_t ramp) {
+    std::vector<std::pair<size_t, size_t>> out;
+    if (total == 0 || segment_bytes == 0) return out;
+    ramp = std::max<size_t>(1, ramp);
+    std::vector<size_t> up;  // first, 2 first, ... below segment_bytes
+    if (first_bytes > 0)
+        for (size_t s = first_bytes; s < segment_bytes; s *= 2) up.push_back(s);
+    size_t tail = 0;
+    for (size_t s : up) tail += s;
+    size_t off = 0, rem = total;
+    auto take = [&](size_t n) {
+        out.emplace_back(off, n);
+        off += n;
+        rem -= n;
+    };
+    if (total <= tail) {
+        // Small: all first-size segments, sealed in parallel.
+        while (rem) take(std::min(first_bytes, rem));
+        return out;
+    }
+    // Ramp up, keeping back exactly `tail` bytes for the ramp down.
+    for (size_t s : up)
+        for (size_t r = 0; r < ramp && rem > tail; ++r)
+            take(std::min(s, rem - tail));
+    while (rem > tail) take(std::min(segment_bytes, rem - tail));
+    for (auto it = up.rbegin(); it != up.rend(); ++it) take(*it);
+    return out;
+}
+
 PushOptions PushOptions::FromEnv() {
     PushOptions o;
     o.threads = std::max<size_t>(1, EnvSize("MC_SECURE_P2D_THREADS", o.threads));
@@ -456,6 +488,9 @@ PushOptions PushOptions::FromEnv() {
     o.segment_bytes = (o.segment_bytes + 63) & ~size_t(63);
     o.window_segments = std::max<size_t>(
         1, EnvSize("MC_SECURE_P2D_WINDOW_SEGMENTS", o.window_segments));
+    o.first_segment_bytes = EnvSize("MC_SECURE_P2D_FIRST_SEGMENT_BYTES",
+                                    o.first_segment_bytes);
+    o.first_segment_bytes = (o.first_segment_bytes + 63) & ~size_t(63);
     o.rx_bytes = EnvSize("MC_SECURE_P2D_RX_BYTES", o.rx_bytes);
     o.tx_bytes = EnvSize("MC_SECURE_P2D_TX_BYTES", o.tx_bytes);
     o.port = static_cast<int>(EnvSize("MC_SECURE_P2D_PORT", 0));
@@ -773,19 +808,83 @@ struct SecurePushService::Receiver {
         return SendFrame(fd, frame);
     }
 
+    // One connection's replies, sent in request order. A commit's reply
+    // waits until its segments are opened, while later requests are read
+    // and their segments opened in parallel.
+    struct Replies {
+        struct Entry {
+            std::string header, body;
+            bool ready = false;
+            bool release = false;  // the push's last commit: free its slots
+            bool fatal = false;    // close the connection after this reply
+        };
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::shared_ptr<Entry>> q;
+        size_t outstanding = 0;  // commits being opened
+        uint64_t lease_id = 0;
+        bool failed = false;
+    };
+
+    // R.mu held. Sends every reply at the head of the queue that is ready.
+    // The slots of a push are freed before its last reply goes out, so the
+    // sender's next RESERVE on this connection finds them free.
+    void Flush(int fd, Replies& R) {
+        while (!R.q.empty() && R.q.front()->ready) {
+            auto e = std::move(R.q.front());
+            R.q.pop_front();
+            if (e->release) {
+                Release(R.lease_id);
+                R.lease_id = 0;
+            }
+            if (!R.failed && !Reply(fd, e->header, e->body)) R.failed = true;
+            if (e->fatal) R.failed = true;
+            // The peer sees the close; Serve's next read fails and it exits.
+            if (R.failed) ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+
+    static std::string CommitReply(int32_t st, uint32_t window) {
+        Writer w;
+        w.U8(kRespCommit);
+        w.I32(st);
+        w.U32(window);
+        return std::move(w.str());
+    }
+
     void Serve(Conn* c) {
         const int fd = c->fd;
         const auto& o = svc->opt_;
-        uint64_t lease_id = 0;
+        Replies R;
+        // Commits in flight on one connection; a legitimate sender has at
+        // most one per slot it holds.
+        const size_t max_outstanding = std::max<uint32_t>(1, nslots);
         std::string frame, body;
         const std::string req_aad = Aad(kAadReq, svc->fabric_.local_name);
         const auto handshake_deadline =
             c->accepted + std::chrono::milliseconds(o.handshake_timeout_ms);
+        auto push_ready = [&](const std::string& header, std::string reply,
+                              bool fatal) {
+            auto e = std::make_shared<Replies::Entry>();
+            e->header = header;
+            e->body = std::move(reply);
+            e->ready = true;
+            e->fatal = fatal;
+            std::lock_guard<std::mutex> lock(R.mu);
+            R.q.push_back(std::move(e));
+            Flush(fd, R);
+        };
         while (!stop.load()) {
+            uint64_t lease_id;
+            {
+                std::lock_guard<std::mutex> lock(R.mu);
+                if (R.failed) break;
+                lease_id = R.lease_id;
+            }
             const bool authed = c->authed.load();
             Clock::time_point header_deadline = handshake_deadline;
             if (authed) {
-                // Between the windows of a push the sender seals and writes,
+                // Between the segments of a push the sender seals and writes,
                 // so a held lease waits at least a step.
                 const int idle = lease_id ? std::max(o.idle_timeout_ms,
                                                      o.timeout_ms)
@@ -844,6 +943,12 @@ struct SecurePushService::Receiver {
                 break;
             }
             if (!authed && !Authenticate(c)) break;
+            // Now, not before the read: a commit that completed meanwhile
+            // may have ended the lease.
+            {
+                std::lock_guard<std::mutex> lock(R.mu);
+                lease_id = R.lease_id;
+            }
             const std::string header = frame.substr(0, kHeaderSize);
             Reader r(body.data(), body.size());
             uint8_t type;
@@ -860,45 +965,74 @@ struct SecurePushService::Receiver {
                 w.U64(reinterpret_cast<uint64_t>(base));
                 w.U64(slot_bytes);
                 w.U32(nslots);
-                if (!Reply(fd, header, w.str())) break;
+                push_ready(header, std::move(w.str()), false);
             } else if (type == kReqReserve) {
                 uint32_t want;
                 Writer w;
                 w.U8(kRespReserve);
                 if (!r.U32(&want) || lease_id != 0) {
                     w.I32(kErrLease);
-                    Reply(fd, header, w.str());
+                    push_ready(header, std::move(w.str()), true);
                     break;
                 }
                 uint64_t id = 0;
                 RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id));
                 id |= 1;
                 auto slots = Lease(id, want);
-                if (!slots.empty()) lease_id = id;
+                if (!slots.empty()) {
+                    std::lock_guard<std::mutex> lock(R.mu);
+                    R.lease_id = id;
+                }
                 w.I32(kOk);
                 w.U64(slots.empty() ? 0 : id);
                 w.U64(slot_bytes);
                 w.U32(static_cast<uint32_t>(slots.size()));
                 for (auto s : slots) w.U32(s);
-                if (!Reply(fd, header, w.str())) break;
+                push_ready(header, std::move(w.str()), false);
             } else if (type == kReqCommit) {
-                uint32_t window = 0;
-                bool last = false;
-                int32_t st = Commit(r, lease_id, sender, &window, &last);
-                Writer w;
-                w.U8(kRespCommit);
-                w.I32(st);
-                w.U32(window);
-                bool sent = Reply(fd, header, w.str());
+                {
+                    std::unique_lock<std::mutex> lock(R.mu);
+                    R.cv.wait(lock, [&] {
+                        return R.outstanding < max_outstanding || R.failed;
+                    });
+                    if (R.failed) break;
+                }
+                auto job = std::make_shared<CommitJob>();
+                job->sender = sender;
+                int32_t st = ParseCommit(r, lease_id, job.get());
                 if (st != kOk) {
                     svc->rejected_.fetch_add(1);
+                    push_ready(header, CommitReply(st, job->window), true);
                     break;
                 }
-                if (last) {
-                    Release(lease_id);
-                    lease_id = 0;
+                auto e = std::make_shared<Replies::Entry>();
+                e->header = header;
+                e->release = job->last;
+                job->entry = e;
+                job->remaining.store(job->segs.size());
+                {
+                    std::lock_guard<std::mutex> lock(R.mu);
+                    R.q.push_back(e);
+                    ++R.outstanding;
                 }
-                if (!sent) break;
+                for (size_t i = 0; i < job->segs.size(); ++i) {
+                    open_pool->Run([this, job, i, fd, &R] {
+                        if (!OpenSegment(job->segs[i], job->sender, job->tid,
+                                         job->total))
+                            job->ok.store(false);
+                        if (job->remaining.fetch_sub(1) != 1) return;
+                        const bool ok = job->ok.load();
+                        if (!ok) svc->rejected_.fetch_add(1);
+                        std::lock_guard<std::mutex> lock(R.mu);
+                        job->entry->body =
+                            CommitReply(ok ? kOk : kErrOpen, job->window);
+                        job->entry->fatal = !ok;
+                        job->entry->ready = true;
+                        --R.outstanding;
+                        Flush(fd, R);
+                        R.cv.notify_all();
+                    });
+                }
             } else {
                 svc->rejected_.fetch_add(1);
                 break;
@@ -907,7 +1041,16 @@ struct SecurePushService::Receiver {
             if (frame.capacity() > (1u << 20)) std::string().swap(frame);
             if (body.capacity() > (1u << 20)) std::string().swap(body);
         }
-        Release(lease_id);
+        // Opens in flight read slots of this lease and reply on this
+        // connection: let them finish (their replies flush as they do).
+        uint64_t lease_left;
+        {
+            std::unique_lock<std::mutex> lock(R.mu);
+            R.cv.wait(lock, [&] { return R.outstanding == 0; });
+            lease_left = R.lease_id;
+            R.lease_id = 0;
+        }
+        Release(lease_left);
         // The peer sees the close now; the descriptor itself is closed by
         // the reaper.
         ::shutdown(fd, SHUT_RDWR);
@@ -920,20 +1063,32 @@ struct SecurePushService::Receiver {
         std::vector<PushPiece> dst;
     };
 
-    int32_t Commit(Reader& r, uint64_t lease_id, const std::string& sender,
-                   uint32_t* window_out, bool* last) {
-        uint64_t lease;
+    // One COMMIT being opened.
+    struct CommitJob {
+        std::string sender;  // authenticated in the commit's sealed body
         uint8_t tid[16];
-        uint32_t window, total, nseg;
+        uint32_t window = 0, total = 0;
+        bool last = false;
+        std::vector<SegCommit> segs;
+        std::atomic<size_t> remaining{0};
+        std::atomic<bool> ok{true};
+        std::shared_ptr<Replies::Entry> entry;
+    };
+
+    // Parses and checks a COMMIT body into `job`. kOk only if every slot is
+    // this connection's and every destination is local-only memory.
+    int32_t ParseCommit(Reader& r, uint64_t lease_id, CommitJob* job) {
+        uint64_t lease;
+        uint32_t nseg;
         uint8_t flags;
-        if (!r.U64(&lease) || !r.Bytes(tid, 16) || !r.U32(&window) ||
-            !r.U32(&total) || !r.U8(&flags) || !r.U32(&nseg))
+        if (!r.U64(&lease) || !r.Bytes(job->tid, 16) || !r.U32(&job->window) ||
+            !r.U32(&job->total) || !r.U8(&flags) || !r.U32(&nseg))
             return kErrBadRequest;
-        *window_out = window;
-        *last = (flags & kCommitLast) != 0;
+        job->last = (flags & kCommitLast) != 0;
         if (lease == 0 || lease != lease_id) return kErrLease;
         if (nseg == 0 || nseg > nslots) return kErrBadRequest;
-        std::vector<SegCommit> segs(nseg);
+        auto& segs = job->segs;
+        segs.resize(nseg);
         {
             std::lock_guard<std::mutex> lock(slots_mu);
             for (auto& s : segs) {
@@ -944,7 +1099,7 @@ struct SecurePushService::Receiver {
                     return kErrBadRequest;
                 if (s.slot >= nslots || slot_lease[s.slot] != lease_id)
                     return kErrLease;
-                if (s.sealed_len > slot_bytes || s.index >= total)
+                if (s.sealed_len > slot_bytes || s.index >= job->total)
                     return kErrBadRequest;
                 s.dst.resize(np);
                 uint64_t sum = 0;
@@ -975,17 +1130,7 @@ struct SecurePushService::Receiver {
                                << " is not local-only registered memory";
                     return kErrBadDestination;
                 }
-
-        std::atomic<bool> ok{true};
-        Latch latch(segs.size());
-        for (auto& s : segs) {
-            open_pool->Run([&, sp = &s] {
-                if (!OpenSegment(*sp, sender, tid, total)) ok.store(false);
-                latch.CountDown();
-            });
-        }
-        latch.Wait();
-        return ok.load() ? kOk : kErrOpen;
+        return kOk;
     }
 
     // `sender` is the name authenticated in the commit's sealed body.
@@ -1355,11 +1500,6 @@ struct SecurePushService::Job {
 
 namespace {
 
-struct SealResult {
-    std::atomic<bool> ok{false};
-    size_t sealed_len = 0;
-};
-
 // Seals one segment into `out` (send staging).
 bool SealSegment(const Segment& seg, const std::string& aad, uint8_t* out,
                  size_t out_size, size_t* sealed_len, SealedInfo* info,
@@ -1450,6 +1590,135 @@ Status SecurePushService::Push(Transport::SegmentID target,
     return result ? Status::OK() : Status::Context("secure push failed");
 }
 
+// ---------------------------------------------------------------- stream --
+
+// The sender side of one push. Segment i is sealed into send staging stride
+// i % S once the segment that last used that stride has been written; it is
+// written to slot i % g as soon as it is sealed and the segment that last
+// used that slot has been acknowledged; it is committed, in order, once its
+// write completed.
+struct SecurePushService::Stream {
+    SecurePushService* svc = nullptr;
+    const Job* job = nullptr;
+    std::string peer_name;
+    size_t seg_bytes = 0;
+    std::vector<std::pair<size_t, size_t>> plan;
+    uint32_t n = 0;  // segments
+    uint32_t S = 0;  // send staging strides
+    size_t stride = 0;
+    StagingBuffer tx;
+    uint8_t* txb = nullptr;
+    Algorithm alg{};
+    bool started = false;
+
+    struct Seg {
+        Segment seg;
+        std::string aad;
+        int state = 0;  // 0 sealing or not launched, 1 sealed, 2 failed
+        size_t sealed_len = 0;
+        bool posted = false, waited = false;
+        void* handle = nullptr;
+        uint64_t remote = 0;
+    };
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<Seg> segs;
+    size_t sealing = 0;
+    bool aborted = false;
+    // Set once the receiver granted slots.
+    bool granted = false;
+    std::vector<uint32_t> slots;
+    uint64_t rx_base = 0, slot_bytes = 0;
+    uint32_t acked = 0;
+
+    ~Stream() { Drain(); }
+
+    uint8_t* Staging(uint32_t i) const {
+        return txb + size_t(i % S) * stride;
+    }
+
+    bool Start() {
+        tx = svc->tx_pool_->Allocate(stride * S);
+        if (!tx) {
+            LOG(ERROR) << "secure push: send staging exhausted";
+            return false;
+        }
+        txb = static_cast<uint8_t*>(tx.data());
+        std::lock_guard<std::mutex> lock(mu);
+        for (uint32_t i = 0; i < S && i < n; ++i) Launch(i);
+        started = true;
+        return true;
+    }
+
+    // mu held.
+    void Launch(uint32_t i) {
+        Seg& sg = segs[i];
+        sg.seg = job->Slice(plan[i].first, plan[i].second);
+        sg.aad = DataAad(peer_name, svc->fabric_.local_name, job->tid, i, n,
+                         sg.seg.dst);
+        ++sealing;
+        uint8_t* out = Staging(i);
+        svc->seal_pool_->Run([this, i, out] {
+            Seg& mine = segs[i];
+            SealedInfo info;
+            size_t len = 0;
+            const bool ok =
+                SealSegment(mine.seg, mine.aad, out, stride, &len, &info, alg);
+            if (ok && svc->hooks_.on_segment_sealed)
+                svc->hooks_.on_segment_sealed(info);
+            std::lock_guard<std::mutex> lock(mu);
+            mine.sealed_len = len;
+            mine.state = ok ? 1 : 2;
+            if (ok) TryPostLocked(i);
+            --sealing;
+            cv.notify_all();
+        });
+    }
+
+    // mu held. Writes segment i if it is sealed and its slot is free.
+    void TryPostLocked(uint32_t i) {
+        Seg& sg = segs[i];
+        const uint32_t g = static_cast<uint32_t>(slots.size());
+        if (aborted || !granted || sg.state != 1 || sg.posted ||
+            i >= acked + g)
+            return;
+        Transport::TransferRequest req;
+        req.opcode = Transport::TransferRequest::WRITE;
+        req.source = Staging(i);
+        req.target_id = job->target;
+        req.target_offset = rx_base + uint64_t(slots[i % g]) * slot_bytes;
+        req.length = sg.sealed_len;
+        sg.remote = req.target_offset;
+        sg.handle = svc->fabric_.begin_ops({req});
+        sg.posted = true;
+    }
+
+    // mu held.
+    void PostReadyLocked() {
+        const uint32_t end =
+            std::min<uint32_t>(n, acked + static_cast<uint32_t>(slots.size()));
+        for (uint32_t i = acked; i < end; ++i) TryPostLocked(i);
+    }
+
+    // Waits for every seal in flight and every write posted but not waited,
+    // so nothing still reads the job's memory or the send staging.
+    void Drain() {
+        std::vector<void*> handles;
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            aborted = true;
+            cv.wait(lock, [&] { return sealing == 0; });
+            for (auto& sg : segs)
+                if (sg.posted && !sg.waited) {
+                    sg.waited = true;
+                    handles.push_back(sg.handle);
+                }
+        }
+        for (void* h : handles)
+            svc->fabric_.wait_ops(h, svc->opt_.timeout_ms);
+    }
+};
+
 bool SecurePushService::RunJob(Job& job) {
     if (job.total == 0) return true;
     if (!EnsureSender()) return false;
@@ -1457,7 +1726,6 @@ bool SecurePushService::RunJob(Job& job) {
     const auto deadline_ms = opt_.timeout_ms;
     std::shared_ptr<Peer> peer;
     int fd = -1;
-    bool reusable = false;
     // Request headers awaiting replies, in order.
     std::deque<std::string> pending;
     auto send = [&](const std::string& body) {
@@ -1483,15 +1751,18 @@ bool SecurePushService::RunJob(Job& job) {
         return true;
     };
 
-    size_t seg_bytes = 0;
-    uint32_t nseg = 0;
+    // Declared after the connection state it uses and destroyed first: its
+    // destructor waits for seals and writes in flight.
+    std::unique_ptr<Stream> st;
     std::vector<uint32_t> slots;
     uint64_t lease = 0;
 
-    // Reserve slots. A connection that fails before its reserve is answered
-    // (a pooled one the receiver closed as idle, a new one dropped while
-    // unauthenticated) is replaced; a new connection that fails sends the
-    // sender back to discovery, with backoff, until the step timeout.
+    // Reserve slots, sealing meanwhile. A connection that fails before its
+    // reserve is answered (a pooled one the receiver closed as idle, a new
+    // one dropped while unauthenticated) is replaced; a new connection that
+    // fails sends the sender back to discovery, with backoff, until the step
+    // timeout. Segments already sealed for the same receiver and segment
+    // size are kept.
     {
         constexpr int kMaxConnectAttempts = 6;
         const auto until = Clock::now() + std::chrono::milliseconds(deadline_ms);
@@ -1508,13 +1779,29 @@ bool SecurePushService::RunJob(Job& job) {
             if (peer) fd = peer->Take(deadline_ms, &reused);
             if (peer && fd >= 0) {
                 // Segment size: ours, capped by the peer's slot.
-                seg_bytes = std::min(opt_.segment_bytes,
-                                     size_t(peer->slot_bytes) - kOverhead) &
-                            ~size_t(63);
-                nseg = static_cast<uint32_t>((job.total + seg_bytes - 1) /
-                                             seg_bytes);
-                const uint32_t want = static_cast<uint32_t>(
-                    std::min<size_t>(nseg, 2 * opt_.window_segments));
+                const size_t seg_bytes =
+                    std::min(opt_.segment_bytes,
+                             size_t(peer->slot_bytes) - kOverhead) &
+                    ~size_t(63);
+                if (!st || st->peer_name != peer->name ||
+                    st->seg_bytes != seg_bytes) {
+                    st.reset();
+                    st = std::make_unique<Stream>();
+                    st->svc = this;
+                    st->job = &job;
+                    st->peer_name = peer->name;
+                    st->seg_bytes = seg_bytes;
+                    st->plan = PlanPushSegments(job.total, seg_bytes,
+                                                opt_.first_segment_bytes,
+                                                opt_.threads);
+                    st->n = static_cast<uint32_t>(st->plan.size());
+                    st->S = static_cast<uint32_t>(std::min<size_t>(
+                        st->n, 2 * opt_.window_segments));
+                    st->stride = (SealedSize(seg_bytes) + 63) & ~size_t(63);
+                    st->segs.resize(st->n);
+                    st->alg = SecureContext::Global().config().algorithm;
+                }
+                const uint32_t want = st->S;
                 pending.clear();
                 enum { kGranted, kConnLost, kRefused } rc = kGranted;
                 for (;;) {
@@ -1523,18 +1810,29 @@ bool SecurePushService::RunJob(Job& job) {
                     w.Str(fabric_.local_name);
                     w.U32(want);
                     std::string body;
-                    if (!send(w.str()) || !recv(&body)) {
+                    if (!send(w.str())) {
+                        rc = kConnLost;
+                        break;
+                    }
+                    // Seal while the request is in flight: sealing needs no
+                    // slots.
+                    if (!st->started && !st->Start()) {
+                        rc = kRefused;
+                        break;
+                    }
+                    if (!recv(&body)) {
                         rc = kConnLost;
                         break;
                     }
                     Reader r(body.data(), body.size());
                     uint8_t type;
-                    int32_t st;
+                    int32_t status;
                     uint64_t slot_bytes;
                     uint32_t n;
-                    if (!r.U8(&type) || type != kRespReserve || !r.I32(&st) ||
-                        st != kOk || !r.U64(&lease) || !r.U64(&slot_bytes) ||
-                        !r.U32(&n) || n > peer->nslots ||
+                    if (!r.U8(&type) || type != kRespReserve ||
+                        !r.I32(&status) || status != kOk || !r.U64(&lease) ||
+                        !r.U64(&slot_bytes) || !r.U32(&n) ||
+                        n > peer->nslots || n > want ||
                         slot_bytes != peer->slot_bytes) {
                         rc = kRefused;
                         break;
@@ -1557,7 +1855,11 @@ bool SecurePushService::RunJob(Job& job) {
                 if (rc == kGranted) break;
                 ::close(fd);
                 fd = -1;
-                if (rc == kRefused) return false;
+                if (rc == kRefused) {
+                    LOG(ERROR) << "secure push: " << peer->name
+                               << " refused the slot reservation";
+                    return false;
+                }
                 if (reused) continue;  // try the next pooled one, or a new one
             }
             {
@@ -1579,170 +1881,121 @@ bool SecurePushService::RunJob(Job& job) {
         }
     }
 
+    const uint32_t n = st->n;
+    const uint32_t g = static_cast<uint32_t>(slots.size());
     {
-        const uint32_t g = static_cast<uint32_t>(slots.size());
-        const uint32_t nbuf = g >= 2 ? 2 : 1;
-        const uint32_t W = g / nbuf;
-        const uint32_t nwin = (nseg + W - 1) / W;
-        const size_t stride = (SealedSize(seg_bytes) + 63) & ~size_t(63);
-        auto tx = tx_pool_->Allocate(stride * W * nbuf);
-        if (!tx) {
-            LOG(ERROR) << "secure push: send staging exhausted";
-            goto fail;
+        std::lock_guard<std::mutex> lock(st->mu);
+        st->slots = slots;
+        st->rx_base = peer->rx_base;
+        st->slot_bytes = peer->slot_bytes;
+        st->granted = true;
+        st->PostReadyLocked();
+    }
+
+    // Reads one commit reply.
+    auto read_ack = [&]() {
+        std::string body;
+        if (!recv(&body)) return false;
+        Reader r(body.data(), body.size());
+        uint8_t type;
+        int32_t status;
+        uint32_t win;
+        std::lock_guard<std::mutex> lock(st->mu);
+        if (!r.U8(&type) || type != kRespCommit || !r.I32(&status) ||
+            !r.U32(&win) || win != st->acked) {
+            LOG(ERROR) << "secure push: malformed commit reply";
+            return false;
         }
-        auto* txb = static_cast<uint8_t*>(tx.data());
-        const Algorithm alg = SecureContext::Global().config().algorithm;
+        if (status != kOk) {
+            LOG(ERROR) << "secure push: " << peer->name << " refused segment "
+                       << win << " (status " << status << ")";
+            return false;
+        }
+        ++st->acked;
+        st->PostReadyLocked();
+        return true;
+    };
+    auto readable = [&] {
+        pollfd p{fd, POLLIN, 0};
+        return ::poll(&p, 1, 0) > 0;
+    };
 
-        struct Win {
-            std::vector<Segment> segs;
-            std::vector<std::string> aads;
-            std::unique_ptr<SealResult[]> res;
-            std::unique_ptr<Latch> latch;
-            bool launched = false;
-        };
-        std::vector<Win> wins(nwin);
-        auto build = [&](uint32_t w) {
-            Win& win = wins[w];
-            const uint32_t first = w * W;
-            const uint32_t count = std::min<uint32_t>(W, nseg - first);
-            for (uint32_t j = 0; j < count; ++j) {
-                const size_t off = size_t(first + j) * seg_bytes;
-                win.segs.push_back(
-                    job.Slice(off, std::min(seg_bytes, job.total - off)));
-                win.aads.push_back(DataAad(peer->name, fabric_.local_name,
-                                           job.tid, first + j, nseg,
-                                           win.segs.back().dst));
-            }
-        };
-        auto launch = [&](uint32_t w) {
-            Win& win = wins[w];
-            build(w);
-            const uint32_t b = w % nbuf;
-            win.res.reset(new SealResult[win.segs.size()]);
-            win.latch = std::make_unique<Latch>(win.segs.size());
-            win.launched = true;
-            for (size_t j = 0; j < win.segs.size(); ++j) {
-                uint8_t* out = txb + (size_t(b) * W + j) * stride;
-                seal_pool_->Run([&, out, wp = &win, j] {
-                    SealedInfo info;
-                    size_t n = 0;
-                    bool ok = SealSegment(wp->segs[j], wp->aads[j], out, stride,
-                                          &n, &info, alg);
-                    if (ok && hooks_.on_segment_sealed)
-                        hooks_.on_segment_sealed(info);
-                    wp->res[j].sealed_len = n;
-                    wp->res[j].ok.store(ok);
-                    wp->latch->CountDown();
-                });
-            }
-        };
-        auto drain = [&] {
-            for (auto& win : wins)
-                if (win.launched) win.latch->Wait();
-        };
-        uint32_t acked = 0;  // windows acknowledged
-        auto wait_ack = [&](uint32_t upto) {  // wait acks for windows < upto
-            while (acked < upto) {
-                std::string body;
-                if (!recv(&body)) return false;
-                Reader r(body.data(), body.size());
-                uint8_t type;
-                int32_t st;
-                uint32_t win;
-                if (!r.U8(&type) || type != kRespCommit || !r.I32(&st) ||
-                    !r.U32(&win) || win != acked) {
-                    LOG(ERROR) << "secure push: malformed commit reply";
-                    return false;
-                }
-                if (st != kOk) {
-                    LOG(ERROR) << "secure push: " << peer->name
-                               << " refused window " << win << " (status "
-                               << st << ")";
-                    return false;
-                }
-                ++acked;
-            }
-            return true;
-        };
-
-        bool ok = true;
-        for (uint32_t w = 0; w < std::min(nbuf, nwin); ++w) launch(w);
-        for (uint32_t w = 0; ok && w < nwin; ++w) {
-            const uint32_t b = w % nbuf;
-            Win& win = wins[w];
-            // The slots of this buffer half are free once the window that
-            // last used them is acknowledged.
-            if (w >= nbuf && !wait_ack(w - nbuf + 1)) {
-                ok = false;
-                break;
-            }
-            win.latch->Wait();
-            std::vector<Transport::TransferRequest> reqs;
-            std::vector<std::pair<uint64_t, size_t>> remote;
-            for (size_t j = 0; j < win.segs.size(); ++j) {
-                if (!win.res[j].ok.load()) {
-                    ok = false;
-                    break;
-                }
-                Transport::TransferRequest req;
-                req.opcode = Transport::TransferRequest::WRITE;
-                req.source = txb + (size_t(b) * W + j) * stride;
-                req.target_id = job.target;
-                req.target_offset =
-                    peer->rx_base + uint64_t(slots[b * W + j]) * peer->slot_bytes;
-                req.length = win.res[j].sealed_len;
-                reqs.push_back(req);
-                remote.emplace_back(req.target_offset, req.length);
-            }
-            if (!ok) break;
-            Status s = fabric_.wait_ops(fabric_.begin_ops(reqs), deadline_ms);
+    bool ok = true;
+    uint32_t c = 0;  // next segment to commit
+    while (ok) {
+        std::unique_lock<std::mutex> lk(st->mu);
+        if (st->acked == n) break;
+        if (c < n && st->segs[c].state == 2) {
+            ok = false;
+            break;
+        }
+        if (c < n && st->segs[c].posted) {
+            auto& sg = st->segs[c];
+            void* h = sg.handle;
+            sg.waited = true;
+            const uint64_t remote = sg.remote;
+            const size_t len = sg.sealed_len;
+            const uint32_t slot = st->slots[c % g];
+            lk.unlock();
+            Status s = fabric_.wait_ops(h, deadline_ms);
             if (!s.ok()) {
                 LOG(ERROR) << "secure push: fabric write to " << peer->name
                            << " failed: " << s.ToString();
                 ok = false;
                 break;
             }
-            if (hooks_.before_commit) hooks_.before_commit(remote);
-            const bool last = (w + 1 == nwin);
+            if (hooks_.before_commit) hooks_.before_commit({{remote, len}});
             Writer cw;
             cw.U8(kReqCommit);
             cw.Str(fabric_.local_name);
             cw.U64(lease);
             cw.Bytes(job.tid, 16);
-            cw.U32(w);
-            cw.U32(nseg);
-            cw.U8(last ? kCommitLast : 0);
-            cw.U32(static_cast<uint32_t>(win.segs.size()));
-            for (size_t j = 0; j < win.segs.size(); ++j) {
-                cw.U32(w * W + static_cast<uint32_t>(j));
-                cw.U32(slots[b * W + j]);
-                cw.U64(win.res[j].sealed_len);
-                cw.U32(static_cast<uint32_t>(win.segs[j].dst.size()));
-                for (auto& d : win.segs[j].dst) {
-                    cw.U64(d.dst);
-                    cw.U64(d.len);
-                }
+            cw.U32(c);
+            cw.U32(n);
+            cw.U8(c + 1 == n ? kCommitLast : 0);
+            cw.U32(1);
+            cw.U32(c);
+            cw.U32(slot);
+            cw.U64(len);
+            const auto& dst = st->segs[c].seg.dst;
+            cw.U32(static_cast<uint32_t>(dst.size()));
+            for (auto& d : dst) {
+                cw.U64(d.dst);
+                cw.U64(d.len);
             }
             if (!send(cw.str())) {
                 ok = false;
                 break;
             }
-            // Free this window's plaintext views; its send staging is reused
-            // by window w + nbuf, sealed now while the peer opens window w.
-            if (w + nbuf < nwin) launch(w + nbuf);
+            lk.lock();
+            // Segment c's staging is free: seal the segment that reuses it.
+            if (c + st->S < n) st->Launch(c + st->S);
+            ++c;
+            lk.unlock();
+            while (ok && !pending.empty() && readable()) ok = read_ack();
+            continue;
         }
-        if (ok) ok = wait_ack(nwin);
-        drain();
-        if (!ok) goto fail;
-        reusable = true;
+        if (c > st->acked && (c == n || st->segs[c].state == 1)) {
+            // Nothing to commit until a slot frees up (or all committed).
+            lk.unlock();
+            ok = read_ack();
+            continue;
+        }
+        // Wait for segment c's seal.
+        if (!st->cv.wait_for(lk, std::chrono::milliseconds(deadline_ms),
+                             [&] { return st->segs[c].state != 0; })) {
+            LOG(ERROR) << "secure push: sealing segment " << c
+                       << " timed out";
+            ok = false;
+        }
+    }
+    st.reset();  // waits for anything still in flight
+    if (!ok) {
+        ::close(fd);
+        return false;
     }
     peer->Give(fd);
     return true;
-
-fail:
-    (void)reusable;
-    ::close(fd);
-    return false;
 }
 
 std::string SecurePushService::SendRawFrameForTesting(const std::string& host,

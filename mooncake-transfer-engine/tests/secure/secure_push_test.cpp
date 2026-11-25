@@ -77,6 +77,9 @@ class SecurePushTest : public ::testing::Test {
         // and many slots.
         setenv("MC_SECURE_P2D_SEGMENT_BYTES", "65536", 1);
         setenv("MC_SECURE_P2D_WINDOW_SEGMENTS", "4", 1);
+        // Ramped first and last segments (16, 32 KiB), so every test
+        // exercises segments of more than one size.
+        setenv("MC_SECURE_P2D_FIRST_SEGMENT_BYTES", "16384", 1);
         setenv("MC_SECURE_P2D_RX_BYTES", std::to_string(4 << 20).c_str(), 1);
         setenv("MC_SECURE_P2D_TIMEOUT_MS", "10000", 1);
         SecureConfig cfg;
@@ -371,7 +374,7 @@ TEST_F(SecurePushTest, TamperedStagingIsDetected) {
         };
     EXPECT_EQ(Transfer(A(), seg, {{src.data(), dst.data(), src.size()}}),
               Transport::TransferStatusEnum::FAILED);
-    EXPECT_EQ(tampered, 1);
+    EXPECT_GE(tampered, 1);
     // Opening failed: the destination holds zeros, never the plaintext.
     for (size_t i = 0; i < dst.size(); ++i) ASSERT_EQ(dst.data()[i], 0) << i;
 }
@@ -586,7 +589,11 @@ TEST_F(SecurePushTest, LargeWindowedTransfer) {
                   .count();
     LOG(INFO) << "large transfer: " << mb << " MiB in " << ms << " ms ("
               << segments << " segments)";
-    EXPECT_EQ(segments.load(), n / 65536);
+    // Every segment sealed exactly once (no reseal on the happy path).
+    EXPECT_EQ(segments.load(),
+              PlanPushSegments(n, 65536, 16384,
+                               PushOptions::FromEnv().threads)
+                  .size());
     ExpectDelivered(pieces);
 }
 
@@ -886,6 +893,38 @@ TEST_F(SecurePushTest, UnauthenticatedAndIdleConnectionsAreClosed) {
     ::close(silent);
     ::close(slow);
     ::close(authed);
+}
+
+// The segment plan covers the push exactly, in order, never over the
+// segment size, starting and ending with the small segments.
+TEST(SecurePushOptions, SegmentPlan) {
+    const size_t seg = 2 << 20, first = 256 << 10;
+    for (size_t total : {size_t(1), size_t(4095), size_t(first), size_t(first + 1),
+                         size_t(1) << 20, size_t(7) << 20, size_t(32) << 20,
+                         size_t(230) << 20, (size_t(1) << 30) + 12345}) {
+        for (size_t ramp : {1, 8}) {
+            auto plan = PlanPushSegments(total, seg, first, ramp);
+            ASSERT_FALSE(plan.empty()) << total;
+            size_t off = 0;
+            for (auto& [o, len] : plan) {
+                ASSERT_EQ(o, off) << total;
+                ASSERT_GT(len, 0u) << total;
+                ASSERT_LE(len, seg) << total;
+                off += len;
+            }
+            EXPECT_EQ(off, total);
+            EXPECT_LE(plan.front().second, first) << total;
+            EXPECT_LE(plan.back().second, first) << total;
+        }
+    }
+    // No ramp: full-size segments, the last one partial.
+    for (size_t f : {size_t(0), seg, 2 * seg}) {
+        auto plan = PlanPushSegments(5 * seg + 7, seg, f, 8);
+        ASSERT_EQ(plan.size(), 6u);
+        for (size_t i = 0; i < 5; ++i) EXPECT_EQ(plan[i].second, seg);
+        EXPECT_EQ(plan.back().second, 7u);
+    }
+    EXPECT_TRUE(PlanPushSegments(0, seg, first, 8).empty());
 }
 
 TEST(SecurePushOptions, CpuList) {

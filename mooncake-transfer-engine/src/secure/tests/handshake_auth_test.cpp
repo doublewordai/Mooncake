@@ -175,7 +175,10 @@ TEST_F(HandshakeAuthTest, NoKeyFailsClosedBothWays) {
 // arrived in an authenticated Metadata message, never from fabric memory and
 // never from a message without a valid tag.
 TEST_F(HandshakeAuthTest, P2dEndpointTravelsOnlyInAuthenticatedMetadata) {
-    const std::string name = "10.0.0.1:1234";
+    // Names unique to this run: learned endpoints outlive a test.
+    static int run = 0;
+    ++run;
+    const std::string name = "10.0.0.1:" + std::to_string(1000 + run);
     AdvertiseP2dEndpoint(name, "10.0.0.1", 18555);
     auto wire =
         Frame(HandShakeRequestType::Metadata, "{\"name\":\"" + name + "\"}");
@@ -198,7 +201,7 @@ TEST_F(HandshakeAuthTest, P2dEndpointTravelsOnlyInAuthenticatedMetadata) {
 
     // Refused: an endpoint in an untagged message or one tagged under
     // another key is never recorded.
-    const std::string forged_name = "10.0.0.2:1";
+    const std::string forged_name = "10.0.0.2:" + std::to_string(1000 + run);
     const std::string forged = "{\"name\":\"" + forged_name +
                                "\",\"mc_secure_p2d\":{\"host\":\"6.6.6.6\","
                                "\"port\":1}}";

@@ -113,20 +113,25 @@ in total) separately from authenticated ones. Both are described, with their
 `MC_SECURE_P2D_*` limits, in
 [`include/secure/secure_push.h`](../../include/secure/secure_push.h).
 
-## Secure push placement and timings
+## Placement and stage timings
 
-A push leaves through the NIC its send staging is registered on, and lands
-through the NIC of the receiver's staging. Each process stages on one NUMA
-node, by default the node of the GPU it pushes from or receives into, and
-registers its staging as that node's memory, so it goes out on the NIC the
-engine uses for that GPU and every rank of a node keeps its own NIC, memory
-and cores. Its crypto threads run on that node's CPUs. The stage timings
-(device copies, seal, fabric write, commit round trip, open) are kept as
-counters and histograms (`SecurePushService::push_stats()`), summarised in
-the log at most once per interval and per push at `VLOG(1)`. Settings
+Sealed bytes leave through the NIC their ciphertext memory is registered on.
+Each secure push service and each store client has a home NUMA node, by
+default that of the GPU it serves, and registers its ciphertext memory (push
+staging; the store client's segment, local buffer and staging) as that
+node's memory, placed there, so every rank of a node keeps its own NIC,
+memory and cores. Its crypto threads and pinned scratch are on that node too.
+Stage timings (device copies, seal, transfer, open; for the push also the
+commit round trip and the committer's waits) are kept as counters and
+histograms (`SecurePushService::push_stats()`,
+`SecurePyClient::store_stats()`), summarised in the log at most once per
+interval, and per push or store call at `VLOG(1)`. The settings are in
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h)
 (`MC_SECURE_P2D_NUMA_NODE`, `MC_SECURE_P2D_CPUS`,
-`MC_SECURE_P2D_STATS_INTERVAL_S`) are in
-[`include/secure/secure_push.h`](../../include/secure/secure_push.h).
+`MC_SECURE_P2D_STATS_INTERVAL_S`) and
+[`mooncake-store/include/secure/sealed_object.h`](../../../mooncake-store/include/secure/sealed_object.h)
+(`MC_SECURE_STORE_NUMA_NODE`, `MC_SECURE_STORE_CPUS`,
+`MC_SECURE_STORE_STATS_INTERVAL_S`).
 
 ## What secure mode refuses
 

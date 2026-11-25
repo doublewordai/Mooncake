@@ -229,6 +229,41 @@ TEST_F(SecureStoreTest, RoundTripLocalAndRemote) {
     }
 }
 
+// Stage telemetry accounts for every call and every segment of a remote put
+// and get (what the DW-1288 contention diagnosis reads); each histogram holds
+// exactly its stage's samples.
+TEST_F(SecureStoreTest, StageTimingsCoverEveryCallAndSegment) {
+    const StoreStats a0 = a_->store_stats(), b0 = b_->store_stats();
+    auto delta = [](const StoreStats& x, const StoreStats& y, StoreStage s) {
+        return y.stage[static_cast<int>(s)].count -
+               x.stage[static_cast<int>(s)].count;
+    };
+    auto value = Pattern(300000, 9);  // 5 segments of 64 KiB, last partial
+    const std::string key = "stages-remote";
+    ASSERT_EQ(a_->put_from(key, value.data(), value.size(),
+                           On("localhost:17942")),
+              0);
+    std::vector<char> out(value.size(), 0);
+    ASSERT_EQ(b_->get_into(key, out.data(), out.size()), int64_t(value.size()));
+    ASSERT_EQ(0, std::memcmp(out.data(), value.data(), value.size()));
+    const StoreStats a1 = a_->store_stats(), b1 = b_->store_stats();
+    const uint64_t segs = LayoutOf(Raw(key)).segment_count;
+    ASSERT_GT(segs, 1u);
+    EXPECT_EQ(delta(a0, a1, StoreStage::kPut), 1u);
+    EXPECT_EQ(delta(a0, a1, StoreStage::kPutTransfer), 1u);
+    EXPECT_EQ(delta(a0, a1, StoreStage::kSeal), segs);
+    EXPECT_EQ(delta(b0, b1, StoreStage::kGet), 1u);
+    EXPECT_EQ(delta(b0, b1, StoreStage::kGetTransfer), 1u);
+    EXPECT_EQ(delta(b0, b1, StoreStage::kOpen), segs);
+    for (const StoreStats* st : {&a1, &b1})
+        for (const StageStats& x : st->stage) {
+            uint64_t in_buckets = 0;
+            for (uint64_t b : x.buckets) in_buckets += b;
+            EXPECT_EQ(in_buckets, x.count);
+        }
+    EXPECT_NE(a1.ToString().find("seal{n="), std::string::npos);
+}
+
 TEST_F(SecureStoreTest, EmptyAndSegmentBoundaryValues) {
     for (size_t n : {size_t(0), size_t(1), kTestSegment - 1, kTestSegment,
                      kTestSegment + 1, 3 * kTestSegment}) {

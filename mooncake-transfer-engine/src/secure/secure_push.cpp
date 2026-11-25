@@ -90,13 +90,6 @@ uint64_t NsSince(Clock::time_point t0) {
             .count());
 }
 
-void AtomicMax(std::atomic<uint64_t>& m, uint64_t v) {
-    uint64_t cur = m.load(std::memory_order_relaxed);
-    while (v > cur &&
-           !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
-    }
-}
-
 // A sum and a maximum, for one push's breakdown.
 struct SumMax {
     std::atomic<uint64_t> sum{0}, max{0};
@@ -604,17 +597,35 @@ void CryptoPool::Run(std::function<void()> fn) {
     cv_.notify_one();
 }
 
+void CryptoPool::SetCpus(std::vector<int> cpus, bool each) {
+    std::lock_guard<std::mutex> lock(mu_);
+    cpus_ = std::move(cpus);
+    each_ = each;
+    ++cpus_gen_;
+}
+
+// mu_ held.
+void CryptoPool::Pin(size_t index) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (cpus_.empty()) {
+        // Unpinned: every CPU this process may use.
+        if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) return;
+    } else if (each_) {
+        CPU_SET(cpus_[index % cpus_.size()], &set);
+    } else {
+        for (int c : cpus_)
+            if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 void CryptoPool::Loop(size_t index) {
-    if (!cpus_.empty()) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        if (each_) {
-            CPU_SET(cpus_[index % cpus_.size()], &set);
-        } else {
-            for (int c : cpus_)
-                if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
-        }
-        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    uint64_t gen = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!cpus_.empty()) Pin(index);
+        gen = cpus_gen_;
     }
     for (;;) {
         std::function<void()> fn;
@@ -622,6 +633,10 @@ void CryptoPool::Loop(size_t index) {
             std::unique_lock<std::mutex> lock(mu_);
             cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
             if (queue_.empty()) return;
+            if (gen != cpus_gen_) {
+                Pin(index);
+                gen = cpus_gen_;
+            }
             fn = std::move(queue_.front());
             queue_.pop_front();
         }
@@ -648,79 +663,29 @@ const char* PushStageName(PushStage s) {
     }
 }
 
-uint64_t StageStats::QuantileUpperUs(double q) const {
-    if (count == 0) return 0;
-    const double want = q * static_cast<double>(count);
-    uint64_t seen = 0;
-    for (int b = 0; b < kStageBuckets; ++b) {
-        seen += buckets[b];
-        if (static_cast<double>(seen) >= want && buckets[b])
-            return b == 0 ? 1 : (1ull << b);
-    }
-    return 1ull << (kStageBuckets - 1);
-}
-
 std::string PushStats::ToString() const {
-    std::string out = "pushes=" + std::to_string(pushes) +
-                      " failed=" + std::to_string(failed_pushes) +
-                      " bytes=" + std::to_string(bytes) +
-                      " rx_segments=" + std::to_string(rx_segments) +
-                      " node=" + std::to_string(numa_node);
-    for (int i = 0; i < static_cast<int>(PushStage::kCount); ++i) {
-        const StageStats& st = stage[i];
-        if (!st.count) continue;
-        char b[160];
-        snprintf(b, sizeof(b),
-                 " %s{n=%llu mean_us=%.0f max_us=%.0f p50_le_us=%llu "
-                 "p99_le_us=%llu}",
-                 PushStageName(static_cast<PushStage>(i)),
-                 static_cast<unsigned long long>(st.count),
-                 st.sum_ns / 1e3 / static_cast<double>(st.count),
-                 st.max_ns / 1e3,
-                 static_cast<unsigned long long>(st.QuantileUpperUs(0.5)),
-                 static_cast<unsigned long long>(st.QuantileUpperUs(0.99)));
-        out += b;
-    }
-    return out;
+    const char* names[static_cast<int>(PushStage::kCount)];
+    for (int i = 0; i < static_cast<int>(PushStage::kCount); ++i)
+        names[i] = PushStageName(static_cast<PushStage>(i));
+    return "pushes=" + std::to_string(pushes) +
+           " failed=" + std::to_string(failed_pushes) +
+           " bytes=" + std::to_string(bytes) +
+           " rx_segments=" + std::to_string(rx_segments) +
+           " node=" + std::to_string(numa_node) +
+           FormatStages(stage, names, static_cast<int>(PushStage::kCount));
 }
 
 // Lock-free cumulative counters: a few relaxed atomic adds per segment.
 struct SecurePushService::Telemetry {
-    struct Stage {
-        std::atomic<uint64_t> count{0}, sum_ns{0}, max_ns{0};
-        std::atomic<uint64_t> buckets[kStageBuckets];
-        Stage() {
-            for (auto& b : buckets) b.store(0, std::memory_order_relaxed);
-        }
-    };
-    Stage stage[static_cast<int>(PushStage::kCount)];
+    StageRecorder stages{static_cast<size_t>(PushStage::kCount)};
     std::atomic<uint64_t> pushes{0}, failed{0}, bytes{0}, rx_segments{0};
-    std::atomic<int64_t> last_summary_s{0};
 
-    static int Bucket(uint64_t ns) {
-        const uint64_t us = ns / 1000;
-        if (us == 0) return 0;
-        const int b = 64 - __builtin_clzll(us);
-        return std::min(b, kStageBuckets - 1);
-    }
     void Record(PushStage s, uint64_t ns) {
-        Stage& st = stage[static_cast<int>(s)];
-        st.count.fetch_add(1, std::memory_order_relaxed);
-        st.sum_ns.fetch_add(ns, std::memory_order_relaxed);
-        AtomicMax(st.max_ns, ns);
-        st.buckets[Bucket(ns)].fetch_add(1, std::memory_order_relaxed);
+        stages.Record(static_cast<size_t>(s), ns);
     }
     PushStats Snapshot() const {
         PushStats p;
-        for (int i = 0; i < static_cast<int>(PushStage::kCount); ++i) {
-            const Stage& st = stage[i];
-            p.stage[i].count = st.count.load(std::memory_order_relaxed);
-            p.stage[i].sum_ns = st.sum_ns.load(std::memory_order_relaxed);
-            p.stage[i].max_ns = st.max_ns.load(std::memory_order_relaxed);
-            for (int b = 0; b < kStageBuckets; ++b)
-                p.stage[i].buckets[b] =
-                    st.buckets[b].load(std::memory_order_relaxed);
-        }
+        stages.Snapshot(p.stage, static_cast<size_t>(PushStage::kCount));
         p.pushes = pushes.load(std::memory_order_relaxed);
         p.failed_pushes = failed.load(std::memory_order_relaxed);
         p.bytes = bytes.load(std::memory_order_relaxed);
@@ -2077,19 +2042,7 @@ struct SecurePushService::Stream {
 };
 
 void SecurePushService::MaybeLogStats() {
-    if (opt_.stats_interval_s <= 0) return;
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                            Clock::now().time_since_epoch())
-                            .count();
-    int64_t last = tm_->last_summary_s.load(std::memory_order_relaxed);
-    if (last == 0) {
-        // The first push starts the interval.
-        tm_->last_summary_s.compare_exchange_strong(last, now);
-        return;
-    }
-    if (now - last < opt_.stats_interval_s ||
-        !tm_->last_summary_s.compare_exchange_strong(last, now))
-        return;
+    if (!tm_->stages.Due(opt_.stats_interval_s)) return;
     LOG(INFO) << "secure push: stage timings since start: "
               << push_stats().ToString();
 }

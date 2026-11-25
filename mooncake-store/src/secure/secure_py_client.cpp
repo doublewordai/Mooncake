@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -31,6 +32,20 @@ namespace secure {
 namespace {
 
 int Err(ErrorCode e) { return toInt(e); }
+
+using Clock = std::chrono::steady_clock;
+
+uint64_t NsSince(Clock::time_point t0) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0)
+            .count());
+}
+
+std::string Ms(uint64_t ns) {
+    char b[32];
+    snprintf(b, sizeof(b), "%.2f", ns / 1e6);
+    return b;
+}
 
 int Refuse(const char *what) {
     LOG(ERROR) << "secure mode: " << what
@@ -58,6 +73,19 @@ int ErrOf(Error e) {
 }  // namespace
 
 bool SecurePyClient::Enabled() { return SecureContext::Global().enabled(); }
+
+StoreStats SecurePyClient::store_stats() const {
+    StoreStats st;
+    stages_.Snapshot(st.stage, static_cast<size_t>(StoreStage::kCount));
+    st.numa_node = home_node_.load();
+    return st;
+}
+
+void SecurePyClient::MaybeLogStats() {
+    if (!stages_.Due(opt_.stats_interval_s)) return;
+    LOG(INFO) << "secure store: stage timings since setup: "
+              << store_stats().ToString();
+}
 
 SecurePyClient::SecurePyClient(std::shared_ptr<PyClient> inner)
     : inner_(std::move(inner)) {}
@@ -118,11 +146,21 @@ int SecurePyClient::SetupInner(const std::function<int()> &setup,
     // A caller-supplied engine may already hold plaintext registrations made
     // outside this decorator's control.
     if (external_engine) return Refuse("a caller-supplied transfer engine");
+    opt_ = StoreCryptoOptions::FromEnv(ctx.config());
+    // Home node: the GPU this rank serves (vLLM sets the device before it
+    // sets up the store), until a registered KV buffer says otherwise.
+    int node = -1;
+    if (opt_.numa_node >= 0)
+        node = opt_.numa_node;
+    else if (opt_.numa_node == StoreCryptoOptions::kNumaAuto)
+        node = CurrentGpuNumaNode();
+    home_node_.store(node);
     int rc;
     {
         // The inner client's segments, hot cache and local buffer only ever
-        // receive sealed bytes, so they are registered with the NIC.
-        CiphertextRegistrationScope scope;
+        // receive sealed bytes, so they are registered with the NIC (the
+        // home node's).
+        CiphertextRegistrationScope scope(node);
         rc = setup();
     }
     if (rc != 0) return rc;
@@ -130,17 +168,20 @@ int SecurePyClient::SetupInner(const std::function<int()> &setup,
     auto inner = inner_;
     pool_ = std::make_unique<StagingPool>(
         ctx.config().staging_region_bytes, ctx.config().staging_max_bytes,
-        [inner](void *p, size_t n) {
-            CiphertextRegistrationScope scope;
+        [this, inner](void *p, size_t n) {
+            CiphertextRegistrationScope scope(home_node_.load());
             return inner->register_buffer(p, n);
         },
         [inner](void *p) { return inner->unregister_buffer(p); });
-    const auto opt = StoreCryptoOptions::FromEnv(ctx.config());
-    crypto_ = std::make_unique<ObjectCrypto>(opt);
+    crypto_ = std::make_unique<ObjectCrypto>(opt_, &stages_);
+    if (node >= 0) {
+        pool_->set_numa_node(node, NumaNodeCpus(node));
+        crypto_->SetHome(node);
+    }
     LOG(INFO) << "secure mode: store client ready (values sealed with "
               << ToString(ctx.config().algorithm) << " in "
-              << opt.segment_bytes << "-byte segments on " << opt.threads
-              << " threads)";
+              << opt_.segment_bytes << "-byte segments on " << opt_.threads
+              << " threads; home NUMA node " << node << ")";
     return 0;
 }
 
@@ -192,6 +233,9 @@ std::vector<int> SecurePyClient::PutMany(const std::vector<std::string> &keys,
                   Err(ErrorCode::INVALID_PARAMS));
         return results;
     }
+    const auto t_call = Clock::now();
+    CryptoTiming timing;
+    uint64_t transfer_ns = 0, bytes = 0;
     // Where each value lives, decided once per piece.
     std::vector<std::vector<Buf>> bufs(keys.size());
     std::vector<bool> pending(keys.size(), true);
@@ -235,7 +279,7 @@ std::vector<int> SecurePyClient::PutMany(const std::vector<std::string> &keys,
             held.push_back(std::move(buf));
         }
         if (jobs.empty()) continue;
-        crypto_->Seal(jobs);
+        crypto_->Seal(jobs, &timing);
         std::vector<std::string> batch_keys;
         std::vector<void *> ptrs;
         std::vector<size_t> sizes;
@@ -254,13 +298,28 @@ std::vector<int> SecurePyClient::PutMany(const std::vector<std::string> &keys,
             sent.push_back(k);
         }
         if (batch_keys.empty()) continue;
+        const auto t0 = Clock::now();
         auto r = upsert
                      ? inner_->batch_upsert_from(batch_keys, ptrs, sizes, config)
                      : inner_->batch_put_from(batch_keys, ptrs, sizes, config);
-        for (size_t j = 0; j < sent.size(); ++j)
+        transfer_ns += NsSince(t0);
+        for (size_t j = 0; j < sent.size(); ++j) {
             results[sent[j]] =
                 j < r.size() ? r[j] : Err(ErrorCode::INTERNAL_ERROR);
+            if (results[sent[j]] == 0)
+                bytes += sizes[j];  // sealed bytes stored
+        }
     }
+    const uint64_t total = NsSince(t_call);
+    stages_.Record(static_cast<size_t>(StoreStage::kPut), total);
+    stages_.Record(static_cast<size_t>(StoreStage::kPutTransfer), transfer_ns);
+    VLOG(1) << "secure store put: " << keys.size() << " keys, " << bytes
+            << " sealed B in " << Ms(total) << " ms; d2h sum "
+            << Ms(timing.d2h_ns.load()) << ", seal sum/max "
+            << Ms(timing.seal_ns.load()) << "/" << Ms(timing.seal_max_ns.load())
+            << ", transfer " << Ms(transfer_ns) << " ms (node "
+            << home_node_.load() << ")";
+    MaybeLogStats();
     return results;
 }
 
@@ -402,6 +461,9 @@ std::vector<int64_t> SecurePyClient::GetMany(
                   Err(ErrorCode::INVALID_PARAMS));
         return results;
     }
+    const auto t_call = Clock::now();
+    CryptoTiming timing;
+    uint64_t transfer_ns = 0;
     auto queries = inner_->batch_query(keys);
     std::vector<uint64_t> sealed_sizes(keys.size(), 0);
     std::vector<std::vector<Buf>> bufs(keys.size());
@@ -492,7 +554,7 @@ std::vector<int64_t> SecurePyClient::GetMany(
             jobs.push_back(std::move(job));
             opened.push_back(k);
         }
-        if (!jobs.empty()) crypto_->Open(jobs);
+        if (!jobs.empty()) crypto_->Open(jobs, &timing);
         const auto now = std::chrono::steady_clock::now();
         for (size_t j = 0; j < jobs.size(); ++j) {
             const size_t k = opened[j];
@@ -532,7 +594,9 @@ std::vector<int64_t> SecurePyClient::GetMany(
             held.push_back(std::move(buf));
         }
         if (batch_keys.empty()) continue;
+        const auto t0 = Clock::now();
         auto r = inner_->batch_get_into(batch_keys, ptrs, sizes);
+        transfer_ns += NsSince(t0);
         std::vector<ObjectCrypto::OpenJob> jobs;
         std::vector<size_t> opened;
         for (size_t j = 0; j < index.size(); ++j) {
@@ -577,7 +641,7 @@ std::vector<int64_t> SecurePyClient::GetMany(
             jobs.push_back(std::move(job));
             opened.push_back(k);
         }
-        crypto_->Open(jobs);
+        crypto_->Open(jobs, &timing);
         for (size_t j = 0; j < jobs.size(); ++j) {
             results[opened[j]] =
                 jobs[j].result == Error::kOk
@@ -585,6 +649,19 @@ std::vector<int64_t> SecurePyClient::GetMany(
                     : ErrOf(jobs[j].result);
         }
     }
+    const uint64_t total = NsSince(t_call);
+    uint64_t bytes = 0;
+    for (int64_t r : results)
+        if (r > 0) bytes += static_cast<uint64_t>(r);
+    stages_.Record(static_cast<size_t>(StoreStage::kGet), total);
+    stages_.Record(static_cast<size_t>(StoreStage::kGetTransfer), transfer_ns);
+    VLOG(1) << "secure store get: " << keys.size() << " keys, " << bytes
+            << " B in " << Ms(total) << " ms; transfer " << Ms(transfer_ns)
+            << ", open sum/max " << Ms(timing.open_ns.load()) << "/"
+            << Ms(timing.open_max_ns.load()) << ", h2d "
+            << Ms(timing.h2d_ns.load()) << " ms (node " << home_node_.load()
+            << ")";
+    MaybeLogStats();
     return results;
 }
 
@@ -697,9 +774,25 @@ std::optional<BufferHandle> SecurePyClient::allocate_client_buffer(size_t) {
     return std::nullopt;
 }
 
-int SecurePyClient::register_buffer(void *, size_t) {
+int SecurePyClient::register_buffer(void *buffer, size_t) {
     // Caller buffers are only read and written by the CPU here; nothing of
-    // theirs is ever registered with the transfer engine.
+    // theirs is ever registered with the transfer engine. The first one (the
+    // KV cache) tells where this client's work belongs: staging, scratch and
+    // crypto threads follow it; the segment, registered at setup, stays.
+    std::lock_guard<std::mutex> lock(setup_mu_);
+    if (opt_.numa_node != StoreCryptoOptions::kNumaAuto || home_from_buffer_ ||
+        !pool_ || !crypto_ || !buffer)
+        return 0;
+    const int node = HomeNumaNode(buffer);
+    if (node < 0) return 0;
+    home_from_buffer_ = true;
+    if (node == home_node_.load()) return 0;
+    LOG(INFO) << "secure mode: store client home NUMA node " << node
+              << " (from the registered buffer; was " << home_node_.load()
+              << ", where its segment stays)";
+    home_node_.store(node);
+    pool_->set_numa_node(node, NumaNodeCpus(node));
+    crypto_->SetHome(node);
     return 0;
 }
 

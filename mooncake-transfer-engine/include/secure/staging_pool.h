@@ -48,6 +48,11 @@ class StagingPool;
 // where mbind is not permitted. nullptr on failure.
 void* MapOnNode(size_t n, int node, const std::vector<int>& cpus);
 
+// Asks the kernel to keep the whole pages of [p, p+n) on NUMA node `node`
+// (preferred) and to move those already placed elsewhere. 0 on success; -1
+// if refused (no permission, node not allowed): placement is then unchanged.
+int PlacePagesOnNode(void* p, size_t n, int node);
+
 // NUMA node holding the (faulted-in) page at `p`, or -1 if unknown.
 int NodeOfPage(const void* p);
 

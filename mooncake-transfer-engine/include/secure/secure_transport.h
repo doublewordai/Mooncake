@@ -53,15 +53,22 @@ namespace secure {
 
 // While an instance is alive on a thread, memory that thread registers with
 // the transfer engine is treated as ciphertext memory and registered with the
-// NIC. Nestable.
+// NIC. Nestable. With a home NUMA node (>= 0), host memory registered without
+// an explicit location is moved to that node (pages not yet placed land
+// there) and registered as that node's memory, so it goes out on that node's
+// NIC; the innermost scope's node applies.
 class CiphertextRegistrationScope {
    public:
-    CiphertextRegistrationScope();
+    explicit CiphertextRegistrationScope(int home_node = -1);
     ~CiphertextRegistrationScope();
     CiphertextRegistrationScope(const CiphertextRegistrationScope&) = delete;
     CiphertextRegistrationScope& operator=(const CiphertextRegistrationScope&) =
         delete;
     static bool Active();
+    static int HomeNode();  // -1: none
+
+   private:
+    int saved_node_;
 };
 
 class SecureTransport final : public Transport {

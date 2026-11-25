@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <thread>
 
 namespace mooncake {
@@ -58,13 +59,7 @@ void* MapOnNode(size_t n, int node, const std::vector<int>& cpus) {
     void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    unsigned long mask[kMaxNodes / (8 * sizeof(unsigned long))] = {};
-    mask[node / (8 * sizeof(unsigned long))] |=
-        1ul << (node % (8 * sizeof(unsigned long)));
-    const long rc = syscall(SYS_mbind, p, n, kMpolPreferred, mask,
-                            static_cast<unsigned long>(kMaxNodes + 1),
-                            kMpolMfMove);
-    if (rc != 0)
+    if (PlacePagesOnNode(p, n, node) != 0)
         VLOG(1) << "secure staging: mbind to node " << node
                 << " refused (errno " << errno
                 << "); placing by first touch";
@@ -83,6 +78,22 @@ void* MapOnNode(size_t n, int node, const std::vector<int>& cpus) {
     });
     t.join();
     return p;
+}
+
+int PlacePagesOnNode(void* p, size_t n, int node) {
+    if (node < 0 || node >= kMaxNodes || !p || !n) return -1;
+    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t a = (reinterpret_cast<uintptr_t>(p) + page - 1) & ~(page - 1);
+    const uintptr_t e = (reinterpret_cast<uintptr_t>(p) + n) & ~(page - 1);
+    if (e <= a) return -1;
+    unsigned long mask[kMaxNodes / (8 * sizeof(unsigned long))] = {};
+    mask[node / (8 * sizeof(unsigned long))] |=
+        1ul << (node % (8 * sizeof(unsigned long)));
+    return syscall(SYS_mbind, reinterpret_cast<void*>(a), e - a,
+                   kMpolPreferred, mask,
+                   static_cast<unsigned long>(kMaxNodes + 1), kMpolMfMove) == 0
+               ? 0
+               : -1;
 }
 
 int NodeOfPage(const void* p) {

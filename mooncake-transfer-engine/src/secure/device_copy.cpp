@@ -114,10 +114,8 @@ int DeviceOf(const void* p) {
     return -1;
 }
 
-int HomeNumaNode(const void* p) {
-    if (!p) return -1;
+int GpuNumaNode(int dev) {
 #ifdef USE_CUDA
-    const int dev = DeviceOf(p);
     if (dev >= 0) {
         char bus[32] = {};
         if (cudaDeviceGetPCIBusId(bus, sizeof(bus), dev) != cudaSuccess) {
@@ -132,7 +130,29 @@ int HomeNumaNode(const void* p) {
             node;
         return node;
     }
+#else
+    (void)dev;
 #endif
+    return -1;
+}
+
+int CurrentGpuNumaNode() {
+#ifdef USE_CUDA
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    return GpuNumaNode(dev);
+#else
+    return -1;
+#endif
+}
+
+int HomeNumaNode(const void* p) {
+    if (!p) return -1;
+    const int dev = DeviceOf(p);
+    if (dev >= 0) return GpuNumaNode(dev);
     return NodeOfPage(p);
 }
 

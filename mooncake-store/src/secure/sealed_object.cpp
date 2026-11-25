@@ -122,6 +122,13 @@ bool AnyDevice(const std::vector<Buf>& v) {
     return false;
 }
 
+uint64_t NsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+}
+
 // Records the first error of a job.
 struct JobStatus {
     std::atomic<int> error{0};
@@ -224,6 +231,25 @@ StoreCryptoOptions StoreCryptoOptions::FromEnv(const SecureConfig& cfg) {
     o.plain_region_bytes = cfg.staging_region_bytes;
     o.plain_max_bytes =
         EnvSize("MC_SECURE_STORE_PLAIN_MAX_BYTES", cfg.staging_max_bytes);
+    if (const char* v = getenv("MC_SECURE_STORE_NUMA_NODE"); v && *v) {
+        const std::string t(v);
+        char* end = nullptr;
+        const long node = strtol(v, &end, 10);
+        if (t == "auto") {
+            o.numa_node = StoreCryptoOptions::kNumaAuto;
+        } else if (t == "none" || t == "off") {
+            o.numa_node = StoreCryptoOptions::kNumaNone;
+        } else if (end != v && *end == '\0' && node >= 0 && node < 256) {
+            o.numa_node = static_cast<int>(node);
+        } else {
+            LOG(WARNING) << "secure store: ignoring malformed "
+                            "MC_SECURE_STORE_NUMA_NODE="
+                         << v << " (auto)";
+        }
+    }
+    o.stats_interval_s = static_cast<int>(std::min<size_t>(
+        86400, EnvSize("MC_SECURE_STORE_STATS_INTERVAL_S",
+                       static_cast<size_t>(o.stats_interval_s))));
     if (const char* c = getenv("MC_SECURE_STORE_CPUS")) {
         if (!ParseCpuList(c, &o.cpus)) {
             LOG(WARNING) << "secure store: ignoring malformed "
@@ -235,10 +261,36 @@ StoreCryptoOptions StoreCryptoOptions::FromEnv(const SecureConfig& cfg) {
     return o;
 }
 
+// ---------------------------------------------------------------- stages --
+
+const char* StoreStageName(StoreStage s) {
+    switch (s) {
+        case StoreStage::kPut: return "put";
+        case StoreStage::kD2H: return "d2h";
+        case StoreStage::kSeal: return "seal";
+        case StoreStage::kPutTransfer: return "put_transfer";
+        case StoreStage::kGet: return "get";
+        case StoreStage::kGetTransfer: return "get_transfer";
+        case StoreStage::kOpen: return "open";
+        case StoreStage::kH2D: return "h2d";
+        default: return "?";
+    }
+}
+
+std::string StoreStats::ToString() const {
+    const char* names[static_cast<int>(StoreStage::kCount)];
+    for (int i = 0; i < static_cast<int>(StoreStage::kCount); ++i)
+        names[i] = StoreStageName(static_cast<StoreStage>(i));
+    return "node=" + std::to_string(numa_node) +
+           FormatStages(stage, names, static_cast<int>(StoreStage::kCount));
+}
+
 // ---------------------------------------------------------------- crypto --
 
-ObjectCrypto::ObjectCrypto(const StoreCryptoOptions& options)
+ObjectCrypto::ObjectCrypto(const StoreCryptoOptions& options,
+                           StageRecorder* stages)
     : opt_(options),
+      stages_(stages),
       // Plaintext for device destinations is staged here: page-locked for
       // the copy engine and never registered with the NIC.
       scratch_(std::make_unique<StagingPool>(
@@ -250,7 +302,14 @@ ObjectCrypto::ObjectCrypto(const StoreCryptoOptions& options)
 
 ObjectCrypto::~ObjectCrypto() { pool_.reset(); }
 
-void ObjectCrypto::Seal(std::vector<SealJob>& jobs) {
+void ObjectCrypto::SetHome(int node) {
+    if (node < 0) return;
+    std::vector<int> cpus = NumaNodeCpus(node);
+    scratch_->set_numa_node(node, cpus);
+    if (opt_.cpus.empty()) pool_->SetCpus(std::move(cpus), false);
+}
+
+void ObjectCrypto::Seal(std::vector<SealJob>& jobs, CryptoTiming* timing) {
     struct Task {
         size_t job;
         uint32_t index;
@@ -292,8 +351,10 @@ void ObjectCrypto::Seal(std::vector<SealJob>& jobs) {
                 uint8_t* bounce = nullptr;
                 if (AnyDevice(t.in)) {
                     // Device -> pinned host on the copy engine, then seal on
-                    // this CPU.
-                    bounce = static_cast<uint8_t*>(ThreadBounce(plain));
+                    // this CPU. Sized for a whole segment, so the buffer is
+                    // pinned once per thread, not regrown.
+                    bounce = static_cast<uint8_t*>(
+                        ThreadBounce(std::max(plain, opt_.segment_bytes)));
                     if (!bounce) st.Fail(Error::kCryptoError);
                 }
                 size_t off = 0;
@@ -307,16 +368,31 @@ void ObjectCrypto::Seal(std::vector<SealJob>& jobs) {
                     }
                     off += b.size;
                 }
-                if (st.get() == Error::kOk && !copies.empty() &&
-                    !CopyDevice(copies))
-                    st.Fail(Error::kCryptoError);
+                if (st.get() == Error::kOk && !copies.empty()) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (!CopyDevice(copies)) st.Fail(Error::kCryptoError);
+                    const uint64_t ns = NsSince(t0);
+                    if (stages_)
+                        stages_->Record(static_cast<size_t>(StoreStage::kD2H),
+                                        ns);
+                    if (timing) timing->d2h_ns.fetch_add(ns);
+                }
                 if (st.get() == Error::kOk) {
                     const std::string aad =
                         SegmentAad(*jobs[t.job].key, layouts[t.job], t.index);
                     size_t n = 0;
+                    const auto t0 = std::chrono::steady_clock::now();
                     Error e = sealer.Seal(in.data(), in.size(),
                                           {aad.data(), aad.size()},
                                           {t.out, t.out_len}, &n);
+                    const uint64_t ns = NsSince(t0);
+                    if (stages_)
+                        stages_->Record(static_cast<size_t>(StoreStage::kSeal),
+                                        ns);
+                    if (timing) {
+                        timing->seal_ns.fetch_add(ns);
+                        AtomicMax(timing->seal_max_ns, ns);
+                    }
                     if (e == Error::kOk && n != t.out_len)
                         e = Error::kCryptoError;
                     if (e != Error::kOk) st.Fail(e);
@@ -343,7 +419,7 @@ StagingBuffer ObjectCrypto::AllocateScratch(size_t bytes) {
     }
 }
 
-void ObjectCrypto::Open(std::vector<OpenJob>& jobs) {
+void ObjectCrypto::Open(std::vector<OpenJob>& jobs, CryptoTiming* timing) {
     auto& opener = SecureContext::Global().opener();
     size_t next = 0;
     while (next < jobs.size()) {
@@ -415,9 +491,18 @@ void ObjectCrypto::Open(std::vector<OpenJob>& jobs) {
                         static_cast<const uint8_t*>(job.sealed.data);
                     ConstSpan in{base + l.SealedOffset(t.index),
                                  kOverhead + l.PlainLength(t.index)};
+                    const auto t0 = std::chrono::steady_clock::now();
                     Error e = opener.Open(in, Purpose::kStoreObject,
                                           {aad.data(), aad.size()},
                                           t.out.data(), t.out.size());
+                    const uint64_t ns = NsSince(t0);
+                    if (stages_)
+                        stages_->Record(static_cast<size_t>(StoreStage::kOpen),
+                                        ns);
+                    if (timing) {
+                        timing->open_ns.fetch_add(ns);
+                        AtomicMax(timing->open_max_ns, ns);
+                    }
                     if (e != Error::kOk) st.Fail(e);
                 }
                 latch.CountDown();
@@ -457,8 +542,16 @@ void ObjectCrypto::Open(std::vector<OpenJob>& jobs) {
             }
             if (dev) copied.push_back(w);
         }
-        if (!copies.empty() && !CopyDevice(copies)) {
-            for (size_t w : copied) jobs[wave[w]].result = Error::kCryptoError;
+        if (!copies.empty()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = CopyDevice(copies);
+            const uint64_t ns = NsSince(t0);
+            if (stages_)
+                stages_->Record(static_cast<size_t>(StoreStage::kH2D), ns);
+            if (timing) timing->h2d_ns.fetch_add(ns);
+            if (!ok)
+                for (size_t w : copied)
+                    jobs[wave[w]].result = Error::kCryptoError;
         }
         scratch.clear();
         scratch_cv_.notify_all();

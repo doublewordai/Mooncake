@@ -46,6 +46,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,7 @@
 #include <vector>
 
 #include "secure/kv_crypto.h"
+#include "secure/stage_stats.h"
 #include "secure/staging_pool.h"
 
 // Hidden: each module that links this (engine.so, _store.so) keeps its own
@@ -106,17 +108,61 @@ std::string LegacyObjectAad(const std::string& key);
 //   MC_SECURE_STORE_SEGMENT_BYTES    plaintext per sealed segment (2 MiB;
 //                                    64 KiB .. 1 GiB)
 //   MC_SECURE_STORE_CPUS             CPU list the crypto threads are pinned
-//                                    to, e.g. "64-71"; unset: not pinned
+//                                    to, one CPU each, e.g. "64-71"; unset:
+//                                    the home node's CPUs (see below), or not
+//                                    pinned if there is no home node
 //   MC_SECURE_STORE_PLAIN_MAX_BYTES  cap on pinned plaintext scratch for gets
 //                                    into GPU memory (MC_SECURE_STAGING_MAX_BYTES)
+//   MC_SECURE_STORE_NUMA_NODE        the client's home NUMA node: "auto"
+//                                    (default: the node of the GPU current at
+//                                    setup, then of the first buffer
+//                                    registered), a node number, or "none".
+//                                    The client's segment, local buffer and
+//                                    staging are registered as that node's
+//                                    memory (so on its NIC) and placed there,
+//                                    as are its scratch and crypto threads.
+//   MC_SECURE_STORE_STATS_INTERVAL_S at most this often, a call logs the
+//                                    cumulative stage timings (60; 0: never).
+//                                    Each call's own breakdown is at VLOG(1).
 struct StoreCryptoOptions {
+    static constexpr int kNumaAuto = -1;
+    static constexpr int kNumaNone = -2;
     size_t threads = 8;
     size_t segment_bytes = 2ull << 20;
     std::vector<int> cpus;
     size_t plain_region_bytes = 256ull << 20;
     size_t plain_max_bytes = 4ull << 30;
+    int numa_node = kNumaAuto;
+    int stats_interval_s = 60;
 
     static StoreCryptoOptions FromEnv(const SecureConfig& cfg);
+};
+
+// Where the time of secure store calls goes (DW-1288). Per call unless noted.
+enum class StoreStage : int {
+    kPut = 0,      // a put call, whole
+    kD2H,          // per segment: device -> pinned host before sealing
+    kSeal,         // per segment: sealing
+    kPutTransfer,  // the inner client's put of the sealed objects
+    kGet,          // a get call, whole
+    kGetTransfer,  // the inner client's get of the sealed objects
+    kOpen,         // per segment: verifying and decrypting
+    kH2D,          // per wave: pinned scratch -> device after verification
+    kCount
+};
+const char* StoreStageName(StoreStage s);
+
+// Cumulative since the client was set up.
+struct StoreStats {
+    StageStats stage[static_cast<int>(StoreStage::kCount)];
+    int numa_node = -1;  // home node in use (-1: none)
+    std::string ToString() const;
+};
+
+// One call's crypto time (sums over its segments, and the longest segment).
+struct CryptoTiming {
+    std::atomic<uint64_t> d2h_ns{0}, seal_ns{0}, open_ns{0}, h2d_ns{0};
+    std::atomic<uint64_t> seal_max_ns{0}, open_max_ns{0};
 };
 
 // A caller buffer and where it lives (device -1: host memory).
@@ -130,8 +176,14 @@ struct Buf {
 // concurrent calls share the pool.
 class ObjectCrypto {
    public:
-    explicit ObjectCrypto(const StoreCryptoOptions& options);
+    // `stages` (optional) receives the per-segment and per-wave stages.
+    explicit ObjectCrypto(const StoreCryptoOptions& options,
+                          StageRecorder* stages = nullptr);
     ~ObjectCrypto();
+
+    // Places scratch regions added from now on, and the crypto threads
+    // (unless MC_SECURE_STORE_CPUS pins them), on NUMA node `node`.
+    void SetHome(int node);
 
     size_t segment_bytes() const { return opt_.segment_bytes; }
     size_t SealedSize(size_t plaintext_len) const {
@@ -145,7 +197,7 @@ class ObjectCrypto {
         Error result = Error::kOk;
     };
     // Seals every job; each job's result is set.
-    void Seal(std::vector<SealJob>& jobs);
+    void Seal(std::vector<SealJob>& jobs, CryptoTiming* timing = nullptr);
 
     struct OpenJob {
         const std::string* key = nullptr;
@@ -158,7 +210,7 @@ class ObjectCrypto {
     // another open error) if any segment fails; kBufferTooSmall if no pinned
     // scratch could be had; kCryptoError if a device copy failed after
     // verification (the device may then hold part of the verified value).
-    void Open(std::vector<OpenJob>& jobs);
+    void Open(std::vector<OpenJob>& jobs, CryptoTiming* timing = nullptr);
 
     // Tests.
     StagingPool& scratch() { return *scratch_; }
@@ -167,6 +219,7 @@ class ObjectCrypto {
     StagingBuffer AllocateScratch(size_t bytes);
 
     StoreCryptoOptions opt_;
+    StageRecorder* stages_ = nullptr;
     std::unique_ptr<StagingPool> scratch_;
     std::mutex scratch_mu_;
     std::condition_variable scratch_cv_;

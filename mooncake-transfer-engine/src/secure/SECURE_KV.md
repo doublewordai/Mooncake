@@ -31,8 +31,12 @@ upstream's.
 The authoritative list, with parsing rules, is
 [`secure_env.h`](secure_env.h); tunables specific to one half are in
 [`include/secure/kv_crypto.h`](../../include/secure/kv_crypto.h),
-[`include/secure/secure_push.h`](../../include/secure/secure_push.h) and
-[`control_auth.h`](control_auth.h).
+[`include/secure/secure_push.h`](../../include/secure/secure_push.h)
+(`MC_SECURE_P2D_*`),
+[`mooncake-store/include/secure/sealed_object.h`](../../../mooncake-store/include/secure/sealed_object.h)
+(`MC_SECURE_STORE_*`: store crypto threads, segment size, CPU pinning,
+plaintext scratch cap) and [`control_auth.h`](control_auth.h). These tune the
+halves only; none switches secure mode or names a key.
 
 A binary built **without** `WITH_SECURE_KV` refuses to start (exit 78, a
 message on stderr) if `MC_SECURE_MODE` or `MC_CONTROL_AUTH` asks for secure

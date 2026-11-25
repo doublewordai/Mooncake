@@ -110,5 +110,10 @@ in total) separately from authenticated ones. Both are described, with their
 - Store RPCs and handshakes without a valid, fresh, unreplayed tag (answered
   with code 401 / dropped).
 
-Not covered: the master admin HTTP API (metrics, key listing, drain jobs) is
-not authenticated; keep it off untrusted networks.
+The master's admin and metrics HTTP server (`--metrics_port`: `/metrics`,
+key and segment queries, `remove_all`, drain jobs, tenant quotas) is not
+authenticated, so in secure mode it binds to loopback only, in the master, the
+HA supervisor and the embedded master alike; `MC_SECURE_ADMIN_BIND` names
+another address. Reach it from inside the pod (`kubectl exec`, or a process
+beside the master) or with `kubectl port-forward`, which needs no sidecar
+([`mooncake-store/src/secure/rpc_auth.h`](../../../mooncake-store/src/secure/rpc_auth.h)).

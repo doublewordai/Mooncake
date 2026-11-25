@@ -43,6 +43,13 @@ bool RpcAuthEnabledForServer();
 // descriptors (rkeys included) from anyone, must not start.
 bool RefuseUnauthenticatedListener(const char *what);
 
+// The address the master's admin/metrics HTTP server (MasterAdminServer:
+// /metrics, key queries, remove_all, drain jobs, tenant quotas) binds to. It
+// has no authentication, so in secure mode it is loopback-only: 127.0.0.1,
+// or MC_SECURE_ADMIN_BIND if set. Off, `requested` is returned unchanged.
+// Read once per call, at server construction.
+std::string AdminBindHost(const std::string &requested);
+
 std::string MakeRpcToken(uint32_t func_id);
 // Throws coro_rpc::rpc_error{kUnauthenticated} unless `attachment` is a valid,
 // fresh, unreplayed tag for `func_id`.

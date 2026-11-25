@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <cstdlib>
 #include <mutex>
 
 #include "control_auth.h"
@@ -40,6 +41,19 @@ bool RefuseUnauthenticatedListener(const char *what) {
     LOG(ERROR) << "Secure mode (MC_SECURE_MODE) refuses to start the "
                << what << ": it has no authentication";
     return true;
+}
+
+std::string AdminBindHost(const std::string &requested) {
+    if (!ca::Enabled()) return requested;
+    std::string host = "127.0.0.1";
+    if (const char *v = std::getenv("MC_SECURE_ADMIN_BIND"); v && *v)
+        host = v;
+    if (host != requested)
+        LOG(WARNING) << "Secure mode: the admin/metrics HTTP server binds to "
+                     << host << ", not " << requested
+                     << " (it is unauthenticated; set MC_SECURE_ADMIN_BIND to "
+                        "choose)";
+    return host;
 }
 
 std::string MakeRpcToken(uint32_t func_id) {

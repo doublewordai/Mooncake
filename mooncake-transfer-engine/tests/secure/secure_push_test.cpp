@@ -774,6 +774,49 @@ TEST_F(SecurePushTest, UnauthenticatedFloodFromManyAddressesDoesNotLockOut) {
     FloodThenPush(C(), B(), 138);
 }
 
+// A flood spread one connection per address ties every address. The
+// connection displaced for a newcomer is the one that has waited longest
+// without authenticating, not an arbitrary one of the tied addresses, so a
+// sender's fresh connection (authenticated a round trip after connecting)
+// outlives the flood connections opened before it.
+TEST_F(SecurePushTest, TiedAddressesDisplaceTheStalestConnection) {
+    auto* rx = B().xport->push_service();
+    ASSERT_TRUE(rx->receiver_enabled());
+    const auto opt = PushOptions::FromEnv();
+    if (!RaiseFdLimit(opt.max_preauth + 2048))
+        GTEST_SKIP() << "RLIMIT_NOFILE too low";
+    // Unauthenticated leftovers of earlier tests time out first.
+    ASSERT_TRUE(WaitFor([&] { return rx->control_stats().preauth_conns == 0; },
+                        3 * opt.handshake_timeout_ms));
+    std::vector<int> fds;
+    for (size_t i = 0; i < opt.max_preauth; ++i) {
+        const std::string from = "127.1." + std::to_string(i / 250) + "." +
+                                 std::to_string(2 + i % 250);
+        int fd = ConnectFrom(from, rx->control_host(), rx->control_port());
+        if (fd < 0 && i == 0) GTEST_SKIP() << "cannot connect from " << from;
+        ASSERT_GE(fd, 0) << from;
+        fds.push_back(fd);
+    }
+    ASSERT_TRUE(WaitFor(
+        [&] { return rx->control_stats().preauth_conns >= opt.max_preauth; },
+        opt.handshake_timeout_ms / 2));
+    const auto before = rx->control_stats();
+    int late = ConnectFrom("127.1.250.2", rx->control_host(), rx->control_port());
+    ASSERT_GE(late, 0);
+    ASSERT_TRUE(WaitFor(
+        [&] {
+            return rx->control_stats().evicted_conns > before.evicted_conns;
+        },
+        opt.handshake_timeout_ms / 2));
+    EXPECT_EQ(rx->control_stats().evicted_conns, before.evicted_conns + 1);
+    EXPECT_GE(MsUntilClosed(fds.front(), 1000), 0);  // the stalest went
+    for (size_t i = fds.size() - 8; i < fds.size(); ++i)
+        EXPECT_LT(MsUntilClosed(fds[i], 20), 0) << i;  // newer ones stay
+    EXPECT_LT(MsUntilClosed(late, 20), 0);
+    for (int fd : fds) ::close(fd);
+    ::close(late);
+}
+
 // An unauthenticated connection's length claim over the cap is refused
 // before anything is allocated for it; one at the cap is read and refused
 // as unauthenticated.

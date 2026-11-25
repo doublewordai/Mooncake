@@ -598,6 +598,9 @@ struct SecurePushService::Receiver {
         std::atomic<bool> done{false};
         std::atomic<bool> authed{false};
         std::atomic<bool> evicted{false};
+        // Its first frame arrived whole and is being verified: about to be
+        // authenticated or dropped, so never displaced for a newcomer.
+        std::atomic<bool> verifying{false};
     };
     std::mutex conns_mu;
     std::list<std::unique_ptr<Conn>> conns;
@@ -688,11 +691,16 @@ struct SecurePushService::Receiver {
     // conns_mu held. Makes room for one more unauthenticated connection from
     // `ip`: if that address is at its cap, drops its oldest; else if all
     // unauthenticated connections are taken, drops the oldest of the address
-    // holding the most. The newcomer is always admitted, so a flood only
-    // ever displaces itself or the largest flooder, and a sender that
-    // authenticates within a round trip is not kept out.
+    // holding the most, and among addresses holding equally many, the
+    // connection that has waited longest without sending a whole first
+    // frame. A connection whose first frame is being verified is never
+    // dropped. The newcomer is always admitted, so a flood only ever
+    // displaces itself or the largest (then the stalest) flooder, and a
+    // sender that authenticates within a round trip is not kept out even by
+    // a flood spread one connection per address.
     void MakeRoom(const std::string& ip) {
         const auto& o = svc->opt_;
+        // ip -> (unauthenticated connections, oldest that may be dropped)
         std::unordered_map<std::string, std::pair<size_t, Conn*>> by_ip;
         size_t total = 0;
         for (auto& c : conns) {
@@ -701,6 +709,7 @@ struct SecurePushService::Receiver {
             ++total;
             auto& e = by_ip[c->ip];
             ++e.first;
+            if (c->verifying.load()) continue;
             if (!e.second || c->accepted < e.second->accepted)
                 e.second = c.get();
         }
@@ -711,11 +720,16 @@ struct SecurePushService::Receiver {
             victim = mine->second.second;
         } else if (total >= std::max<size_t>(1, o.max_preauth)) {
             size_t most = 0;
-            for (auto& kv : by_ip)
-                if (kv.second.first > most) {
+            for (auto& kv : by_ip) {
+                Conn* cand = kv.second.second;
+                if (!cand) continue;
+                if (kv.second.first > most ||
+                    (kv.second.first == most &&
+                     cand->accepted < victim->accepted)) {
                     most = kv.second.first;
-                    victim = kv.second.second;
+                    victim = cand;
                 }
+            }
         }
         if (victim) {
             victim->evicted.store(true);
@@ -728,11 +742,49 @@ struct SecurePushService::Receiver {
         }
     }
 
+    // At most once a minute, at the default log level: what the control
+    // server dropped since the last summary (each drop logs only at VLOG(1)
+    // or rate-limited).
+    Clock::time_point last_summary = Clock::now();
+    uint64_t sum_evicted = 0, sum_timed_out = 0, sum_oversized = 0,
+             sum_refused = 0, sum_rejected = 0;
+    void MaybeSummarize() {
+        const auto now = Clock::now();
+        if (now - last_summary < std::chrono::seconds(60)) return;
+        last_summary = now;
+        const uint64_t e = evicted.load(), t = timed_out.load(),
+                       o = oversized.load(), r = refused.load(),
+                       j = svc->rejected_.load();
+        const uint64_t de = e - sum_evicted, dt = t - sum_timed_out,
+                       dov = o - sum_oversized, dr = r - sum_refused,
+                       dj = j - sum_rejected;
+        sum_evicted = e;
+        sum_timed_out = t;
+        sum_oversized = o;
+        sum_refused = r;
+        sum_rejected = j;
+        if (!de && !dt && !dov && !dr && !dj) return;
+        const std::string msg =
+            "secure push: control server, last minute: " + std::to_string(de) +
+            " unauthenticated connections evicted, " + std::to_string(dt) +
+            " closed on handshake or idle timeout, " + std::to_string(dov) +
+            " oversized frame claims, " + std::to_string(dr) +
+            " authenticated connections refused (cap), " + std::to_string(dj) +
+            " requests rejected (totals " + std::to_string(e) + ", " +
+            std::to_string(t) + ", " + std::to_string(o) + ", " +
+            std::to_string(r) + ", " + std::to_string(j) + ")";
+        if (de || dov || dr || dj)
+            LOG(WARNING) << msg;
+        else
+            LOG(INFO) << msg;
+    }
+
     void AcceptLoop() {
         while (!stop.load()) {
             pollfd pf{listen_fd, POLLIN, 0};
             int pr = ::poll(&pf, 1, 500);
             if (stop.load()) return;
+            MaybeSummarize();
             if (pr <= 0) {
                 std::lock_guard<std::mutex> lock(conns_mu);
                 Reap();
@@ -926,6 +978,7 @@ struct SecurePushService::Receiver {
                 break;
             }
             if (rr != Rx::kOk) break;
+            if (!authed) c->verifying.store(true);
             SealedInfo info;
             if (frame.size() < kHeaderSize ||
                 !OpenControl(frame, req_aad, &body, &info)) {

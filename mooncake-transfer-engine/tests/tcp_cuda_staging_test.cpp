@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -170,10 +171,125 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
     read.target_offset = remote_base + kTransferSize;
     ASSERT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED);
     EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 2u);
-    // The client session is new; the persistent server session retains the
-    // staging allocation used by the preceding WRITE.
-    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 1u);
+    // The persistent server session retains its staging buffer, and the new
+    // client session reuses the pinned block released by the WRITE's session.
+    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 0u);
 
+    ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + 2 * kTransferSize,
+                         actual.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, pattern);
+
+    EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
+    engine.reset();
+}
+
+// Holds every blocking stream on the current device (and therefore the
+// legacy default stream) until release() is called, standing in for an
+// application whose kernels keep the GPU busy.
+class LegacyStreamBlocker {
+   public:
+    LegacyStreamBlocker() {
+        if (cudaStreamCreate(&stream_) != cudaSuccess) return;
+        if (cudaLaunchHostFunc(stream_, &LegacyStreamBlocker::wait,
+                               &released_) != cudaSuccess)
+            return;
+        armed_ = true;
+    }
+    ~LegacyStreamBlocker() {
+        release();
+        if (stream_) {
+            cudaStreamSynchronize(stream_);
+            cudaStreamDestroy(stream_);
+        }
+    }
+    bool armed() const { return armed_; }
+    void release() { released_.store(true); }
+
+   private:
+    static void wait(void* flag) {
+        auto* released = static_cast<std::atomic<bool>*>(flag);
+        while (!released->load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    cudaStream_t stream_ = nullptr;
+    std::atomic<bool> released_{false};
+    bool armed_ = false;
+};
+
+// Device<->staging copies must not be ordered behind the application's work:
+// with the legacy default stream every slice waited for all queued kernels.
+TEST(TcpCudaStagingTest, DeviceTransfersDoNotWaitForBusyBlockingStreams) {
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    if (cuda_status != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    ScopedEnvVar connection_pool("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar slice_size("MC_TCP_SLICE_SIZE", "65536");
+
+    constexpr size_t kTransferSize = 4 * 64 * 1024;
+    constexpr size_t kBufferSize = 3 * kTransferSize;
+
+    DeviceBuffer device_buffer;
+    ASSERT_EQ(cudaMalloc(device_buffer.out(), kBufferSize), cudaSuccess);
+    std::vector<unsigned char> pattern(kTransferSize);
+    for (size_t i = 0; i < pattern.size(); ++i)
+        pattern[i] = static_cast<unsigned char>((i * 13 + 5) & 0xFF);
+    ASSERT_EQ(cudaMemcpy(device_buffer.get(), pattern.data(), pattern.size(),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    const std::string server_name = "127.0.0.2:17933";
+    const auto hostname_port = parseHostNameWithPort(server_name);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, server_name,
+                           hostname_port.first.c_str(), hostname_port.second),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(
+        engine->registerLocalMemory(device_buffer.get(), kBufferSize, "cuda:0"),
+        0);
+    const auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
+    const auto segment_desc =
+        engine->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    const uint64_t remote_base = segment_desc->buffers[0].addr;
+    auto* device_bytes = static_cast<unsigned char*>(device_buffer.get());
+
+    TransferStatusEnum write_status, read_status;
+    {
+        LegacyStreamBlocker blocker;
+        ASSERT_TRUE(blocker.armed());
+
+        TransferRequest write;
+        write.opcode = TransferRequest::WRITE;
+        write.length = kTransferSize;
+        write.source = device_bytes;
+        write.target_id = segment_id;
+        write.target_offset = remote_base + kTransferSize;
+        write_status = runOne(engine.get(), write);
+
+        TransferRequest read;
+        read.opcode = TransferRequest::READ;
+        read.length = kTransferSize;
+        read.source = device_bytes + 2 * kTransferSize;
+        read.target_id = segment_id;
+        read.target_offset = remote_base + kTransferSize;
+        read_status = runOne(engine.get(), read);
+        // Release before asserting so a regression fails instead of hanging
+        // in the blocker's destructor behind a stuck copy.
+        blocker.release();
+    }
+    EXPECT_EQ(write_status, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(read_status, TransferStatusEnum::COMPLETED);
+
+    std::vector<unsigned char> actual(kTransferSize);
     ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + 2 * kTransferSize,
                          actual.size(), cudaMemcpyDeviceToHost),
               cudaSuccess);

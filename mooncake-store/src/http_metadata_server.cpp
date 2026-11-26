@@ -7,6 +7,10 @@
 #include <mutex>
 #include <string>
 
+#ifdef MOONCAKE_WITH_SECURE_KV
+#include "rpc_auth.h"
+#endif
+
 namespace mooncake {
 
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
@@ -108,6 +112,10 @@ void HttpMetadataServer::init_server() {
 }
 
 bool HttpMetadataServer::start() {
+#ifdef MOONCAKE_WITH_SECURE_KV
+    if (secure::RefuseUnauthenticatedListener("HTTP metadata server"))
+        return false;
+#endif
     if (running_) {
         return true;
     }

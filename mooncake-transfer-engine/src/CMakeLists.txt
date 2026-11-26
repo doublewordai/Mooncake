@@ -66,6 +66,11 @@ if(USE_HTTP)
   target_link_libraries(transfer_metadata_plugin PRIVATE ${CURL_LIBRARIES})
 endif()
 
+if(WITH_SECURE_KV)
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  add_subdirectory(secure)
+  list(APPEND ENGINE_SOURCES $<TARGET_OBJECTS:mooncake_secure>)
+endif()
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 target_include_directories(
@@ -94,6 +99,13 @@ if(UNIX AND NOT APPLE)
   # shm_open/shm_unlink live in librt on glibc; OBJECT-library PRIVATE deps do
   # not propagate through $<TARGET_OBJECTS:shm_transport>.
   target_link_libraries(transfer_engine PRIVATE rt)
+endif()
+if(WITH_SECURE_KV)
+  target_link_libraries(transfer_engine PUBLIC OpenSSL::Crypto)
+  # The handshake framing hook (installed from TransferMetadata's constructor).
+  target_sources(transfer_engine
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/secure/handshake_auth.cpp)
+  target_link_libraries(transfer_engine PUBLIC mooncake_control_auth)
 endif()
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)

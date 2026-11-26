@@ -210,6 +210,8 @@ struct RpcTimeoutEnvironmentVariables {
     // prefixes are accepted, unlike the shared typed integer parser.
     MC_DEFINE_ENV_VAR(std::string, MC_RPC_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_RETRIES);
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_RECONNECT_WAIT_MS);
 };
 
 struct RpcProtocolEnvironmentVariables {

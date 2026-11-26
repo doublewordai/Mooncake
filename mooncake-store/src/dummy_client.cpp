@@ -19,6 +19,7 @@
 #include "common/result.h"
 #include "common/scoped_vlog_timer.h"
 #include "rpc_types.h"
+#include "rpc_registrar.h"
 #include "types.h"
 #include "default_config.h"
 #include "config.h"
@@ -201,8 +202,8 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    return RpcSendRequest<ServiceMethod>(
+                        client, std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";
@@ -243,8 +244,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    return RpcSendRequest<ServiceMethod>(
+                        client, std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Dummy Client not available";

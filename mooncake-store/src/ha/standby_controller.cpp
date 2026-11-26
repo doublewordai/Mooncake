@@ -12,6 +12,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
+#include "ha/snapshot/object/backends/peer/peer_snapshot_object_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
@@ -131,7 +132,11 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                 batch_backend_ = std::make_unique<EtcdHaKvBackend>();
                 auto type = ParseSnapshotObjectStoreType(
                     config_.snapshot_object_store_type);
-                snapshot_object_store_ = SnapshotObjectStore::Create(type);
+                snapshot_object_store_ =
+                    type == SnapshotObjectStoreType::PEER
+                        ? CreatePeerSnapshotObjectStore(config_.cluster_id,
+                                                        *batch_backend_)
+                        : SnapshotObjectStore::Create(type);
                 const std::string snapshot_root =
                     BuildBatchOpLogSnapshotRoot(config_.cluster_id);
                 if (snapshot_root.empty()) {

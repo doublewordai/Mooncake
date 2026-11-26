@@ -9,7 +9,12 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "rpc_registrar.h"
 #include "version.h"
+
+#ifdef WITH_SECURE_KV
+#include "secure/entry_guard.h"
+#endif
 
 using namespace mooncake;
 
@@ -35,8 +40,9 @@ DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
 namespace mooncake {
-void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
+void RegisterClientRpcService(coro_rpc::coro_rpc_server &rpc_server,
                               RealClient &real_client) {
+    RpcRegistrar server(rpc_server);
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
@@ -130,6 +136,11 @@ int main(int argc, char *argv[]) {
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
+#ifdef WITH_SECURE_KV
+    if (mooncake::secure::RefuseUnsealedEntryPoint(
+            "the standalone store client (mooncake_client)"))
+        return 78;  // EX_CONFIG, as secure_mode_guard.h
+#endif
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
     size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);

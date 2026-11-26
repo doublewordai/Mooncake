@@ -22,6 +22,10 @@ std::unique_ptr<SnapshotObjectStore> SnapshotObjectStore::Create(
 #endif
         case SnapshotObjectStoreType::LOCAL_FILE:
             return std::make_unique<LocalFileSnapshotObjectStore>();
+        case SnapshotObjectStoreType::PEER:
+            throw std::invalid_argument(
+                "the peer snapshot object store needs the HA backend; create "
+                "it with CreatePeerSnapshotObjectStore");
         default:
             throw std::invalid_argument("Unknown snapshot object store type");
     }

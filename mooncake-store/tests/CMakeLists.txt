@@ -348,6 +348,9 @@ add_ha_test(batch_oplog_snapshot_promotion_test
             ha/snapshot/batch_oplog/promotion_test.cpp)
 add_ha_test(batch_oplog_snapshot_rebootstrap_test
             ha/snapshot/batch_oplog/rebootstrap_test.cpp)
+add_ha_test(
+  peer_snapshot_object_store_test
+  ha/snapshot/object/backends/peer/peer_snapshot_object_store_test.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
 add_store_test(nvme_kv_executor_config_test nvme_kv/executor_config_test.cpp)
@@ -525,3 +528,10 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(WITH_SECURE_KV)
+  add_store_test(secure_store_test secure/secure_store_test.cpp)
+  if(USE_CUDA)
+    target_link_libraries(secure_store_test PRIVATE CUDA::cudart)
+  endif()
+endif()

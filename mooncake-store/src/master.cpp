@@ -27,6 +27,7 @@
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
 #include "rpc_service.h"
+#include "secure_mode_guard.h"
 #include "shutdown_request.h"
 #include "types.h"
 #include "common/network.h"

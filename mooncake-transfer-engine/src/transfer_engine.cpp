@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+#include "secure_mode_guard.h"
 
 namespace mooncake {
 namespace {
@@ -392,6 +393,9 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
+#ifdef WITH_SECURE_KV
+#include "secure/kv_crypto.h"
+#endif
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
 #include "config.h"
 #endif
@@ -678,6 +682,13 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         if (result == 0) metadata_conn_string_ = metadata_conn_string;
         return result;
     } else {
+#ifdef WITH_SECURE_KV
+        // TENT does not go through the secure transport decorator.
+        if (secure::SecureModeEnabled()) {
+            LOG(ERROR) << "secure mode: refusing to start TENT";
+            return -1;
+        }
+#endif
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);

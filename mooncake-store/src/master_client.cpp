@@ -12,6 +12,7 @@
 
 #include "mutex.h"
 #include "rpc_service.h"
+#include "rpc_registrar.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
@@ -373,8 +374,8 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
             auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    return RpcSendRequest<ServiceMethod>(
+                        client, std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
@@ -436,8 +437,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
+                    return RpcSendRequest<ServiceMethod>(
+                        client, std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";

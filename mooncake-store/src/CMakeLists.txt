@@ -83,6 +83,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/peer/peer_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
     task_manager.cpp
     ha/oplog/oplog_types.cpp
@@ -546,6 +547,10 @@ if(STORE_USE_K8S_LEASE)
   add_dependencies(mooncake_store_master_objects build_k8s_lease_wrapper)
 endif()
 
+if(WITH_SECURE_KV)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES secure/secure_py_client.cpp
+       secure/sealed_object.cpp)
+endif()
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
@@ -829,4 +834,8 @@ if(WITH_STORE_C_SHARED)
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
+endif()
+
+if(WITH_SECURE_KV)
+  add_subdirectory(secure)
 endif()

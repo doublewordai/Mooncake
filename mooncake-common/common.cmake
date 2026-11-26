@@ -76,6 +76,17 @@ if(BUILD_UNIT_TESTS)
   include(${CMAKE_CURRENT_LIST_DIR}/FindGTest.cmake)
 endif()
 option(BUILD_BENCHMARK "Build benchmarks" ON)
+option(WITH_SECURE_KV
+       "Build secure mode (DW-1288): KV encryption and control-plane authentication (src/secure/); off by default" OFF)
+if(WITH_SECURE_KV)
+  # The data path tests WITH_SECURE_KV, the control plane
+  # MOONCAKE_WITH_SECURE_KV; both mean the same build.
+  add_compile_definitions(WITH_SECURE_KV MOONCAKE_WITH_SECURE_KV)
+  # The seams include these headers wherever they are instantiated.
+  include_directories(
+    ${CMAKE_CURRENT_LIST_DIR}/../mooncake-transfer-engine/src/secure
+    ${CMAKE_CURRENT_LIST_DIR}/../mooncake-store/src/secure)
+endif()
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
 option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
        OFF)
